@@ -13,6 +13,7 @@ from vllm_ascend.worker.lwd_cloud_model.v2.cloud_input import (
 )
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch
 from vllm_ascend.worker.v2.model_states.default import AscendModelState
+from vllm_ascend.worker.v2.model_states.mamba_hybrid import AscendMambaHybridModelState
 
 
 class LwdAscendCloudModelState(LwdCloudModelStateMixin, AscendModelState):
@@ -52,3 +53,7 @@ class LwdAscendCloudModelState(LwdCloudModelStateMixin, AscendModelState):
 
     def publish_lwd_hash_forward_context(self, context: Any, num_tokens: int) -> None:
         self.lwd_input_assembler.publish_hash_forward_context(context, num_tokens)
+
+
+class LwdAscendCloudMambaHybridModelState(LwdAscendCloudModelState, AscendMambaHybridModelState):
+    """LWD prompt injection and sampling with native hybrid-state execution."""
