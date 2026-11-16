@@ -31,6 +31,10 @@ class LwdEdgeModelRunnerV2(LwdEdgeModelRunner, NPUModelRunner):
         self._lwd_staging_rings: dict[str, LwdPinnedStaging] = {}
         self._init_lwd_edge_execution(worker)
 
+    @LwdEdgeModelRunner.use_dcp.setter
+    def use_dcp(self, enabled: bool) -> None:
+        self.dcp_size = self.parallel_config.decode_context_parallel_size if enabled else 1
+
     def load_model(self, *args: Any, **kwargs: Any) -> None:
         NPUModelRunner.load_model(self, *args, **kwargs)
         self._load_lwd_edge_hash_tables()
