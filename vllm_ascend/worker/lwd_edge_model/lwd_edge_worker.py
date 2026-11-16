@@ -13,6 +13,9 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+# Registers the `lwd_edge` load format, which the edge projection selects, in
+# the worker process that resolves the model loader.
+import vllm.v1.lwd_control.lwd_model.lwd_edge_loader  # noqa: F401
 from vllm.lwd_logger import lwd_logger
 from vllm.v1.core.sched.output import LwdBatchType
 from vllm.v1.lwd_control.lwd_control_diag import LwdControlDiag
