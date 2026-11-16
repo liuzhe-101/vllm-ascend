@@ -565,8 +565,16 @@ def test_build_fia_params_decode():
     assert result[1]["actual_seq_lengths_kv"] == [12, 30, 0]
 
 
-def test_set_attn_detects_architecture():
-    """Test detection of the attention architecture."""
+def test_set_attn_detects_architecture_without_qwen4_exp(monkeypatch):
+    """Non-QSA initialization must not require optional Qwen4Exp modules."""
+    real_import = __import__
+
+    def import_without_qwen4_exp(name, *args, **kwargs):
+        if name.startswith(("vllm_ascend.models.qwen4_exp", "vllm.models.qwen4_exp")):
+            raise ImportError("Qwen4Exp is unavailable")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.__import__", import_without_qwen4_exp)
     cases = [
         (AscendDSABackend, "DSA"),
         (AscendMLABackend, "MLA"),
@@ -594,6 +602,33 @@ def test_set_attn_detects_architecture():
             speculator.set_attn(object(), object(), object(), object(), object())
         assert speculator.attn_backend is backend
         assert speculator.attn_architecture == expected
+
+
+def test_set_attn_detects_qwen4_exp_qsa():
+    """QSA keeps its architecture detection after making its import conditional."""
+    from vllm_ascend.models.qwen4_exp.qsa import AscendQSABackend
+
+    speculator = AscendTargetDependentARSpeculator.__new__(AscendTargetDependentARSpeculator)
+    speculator.vllm_config = object()
+    speculator.attn_groups = object()
+    speculator.speculative_config = SimpleNamespace(  # type: ignore[assignment]
+        moe_backend=None, attention_backend=None, kv_cache_dtype=None
+    )
+    with (
+        patch(
+            "vllm_ascend.worker.v2.spec_decode.target_dependent_ar.speculator.set_current_vllm_config",
+            return_value=nullcontext(),
+        ),
+        patch.object(TargetDependentARSpeculator, "set_attn"),
+        patch(
+            "vllm_ascend.worker.v2.spec_decode.target_dependent_ar.speculator._get_graph_update_backend",
+            return_value=AscendQSABackend,
+        ),
+    ):
+        speculator.set_attn(object(), object(), object(), object(), object())
+
+    assert speculator.attn_backend is AscendQSABackend
+    assert speculator.attn_architecture == "QSA"
 
 
 def test_capture_single_step_only_captures_prefill():
