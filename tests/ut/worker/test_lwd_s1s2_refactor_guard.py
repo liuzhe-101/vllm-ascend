@@ -110,14 +110,14 @@ def test_draft_cache_weave_removed() -> None:
 def test_pinned_staging_single_implementation() -> None:
     runner = _RUNNER.read_text(encoding="utf-8")
     edge = _EDGE.read_text(encoding="utf-8")
-    base = (_REPO_ROOT / "vllm_ascend/worker/lwd_base_model/lwd_base_model_runner.py").read_text(encoding="utf-8")
+    base = (_REPO_ROOT / "vllm_ascend/worker/lwd_base_model/lwd_staging_mixin.py").read_text(encoding="utf-8")
     assert base.count("LwdPinnedStaging(") == 1  # the named lazy factory is the sole constructor
     assert runner.count("LwdPinnedStaging(") == 0  # the cloud delegates via _lwd_staging
     assert runner.count("self._lwd_staging(") == 1  # down_index only; meta harvest lives on the worker
     assert '"down_index"' in runner
     assert '"down_meta"' not in runner
     assert edge.count("LwdPinnedStaging(") == 0  # the edge worker is pure dispatch
-    edge_runner_path = _REPO_ROOT / "vllm_ascend/worker/lwd_edge_model/lwd_edge_model_runner.py"
+    edge_runner_path = _REPO_ROOT / "vllm_ascend/worker/lwd_edge_model/lwd_edge_execution.py"
     edge_runner = edge_runner_path.read_text(encoding="utf-8")
     assert edge_runner.count("self._lwd_staging(") == 1  # ids staging goes through the factory
     for stale in ("_lwd_pinned_ring_idx", "_lwd_h2d_ring_idx"):
@@ -239,7 +239,7 @@ def test_layer_trace_rehomed_and_installed() -> None:
     install from their own load_model (env-gated); centralized is manual opt-in.
     """
     worker = _WORKER.read_text(encoding="utf-8")
-    edge_runner_path = _REPO_ROOT / "vllm_ascend/worker/lwd_edge_model/lwd_edge_model_runner.py"
+    edge_runner_path = _REPO_ROOT / "vllm_ascend/worker/lwd_edge_model/lwd_edge_execution.py"
     edge_runner_src = edge_runner_path.read_text(encoding="utf-8")
     assert "install_lwd_layer_trace(self.get_model())" in edge_runner_src
     assert "install_lwd_layer_trace(self.model_runner.get_model())" in worker

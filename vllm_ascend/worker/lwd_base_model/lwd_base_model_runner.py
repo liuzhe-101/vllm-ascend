@@ -8,47 +8,30 @@ lazy staging factory that three call sites used to hand-roll.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
 
 from vllm_ascend.worker.lwd_base_model.lwd_pinned_staging import LwdPinnedStaging
+from vllm_ascend.worker.lwd_base_model.lwd_staging_mixin import LwdStagingMixin
 from vllm_ascend.worker.v1.model_runner import NPUModelRunner
 
+if TYPE_CHECKING:
+    from vllm.config import VllmConfig
 
-class LwdBaseModelRunner(NPUModelRunner):
+    from vllm_ascend.worker.lwd_base_model.lwd_worker_base import LwdWorkerBase
+
+
+class LwdBaseModelRunner(LwdStagingMixin, NPUModelRunner):
     """NPUModelRunner base shared by the edge/cloud LWD runners."""
 
     def __init__(
         self,
-        vllm_config: "VllmConfig",
-        device: "torch.device",
-        worker: "LwdWorkerBase | None" = None,
+        vllm_config: VllmConfig,
+        device: torch.device,
+        worker: LwdWorkerBase | None = None,
     ) -> None:
         super().__init__(vllm_config, device)
         self.worker = worker  # LwdWorkerBase ref (comm service lives there)
         # Named lazy staging rings; see _lwd_staging.
         self._lwd_staging_rings: dict[str, LwdPinnedStaging] = {}
-
-    def _lwd_staging(
-        self,
-        name: str,
-        *,
-        dtype: "torch.dtype",
-        min_capacity: int,
-        device_mirror: bool = True,
-    ) -> LwdPinnedStaging:
-        """Named lazy pinned-staging ring; the single home of the
-        create-once pattern that edge/cloud call sites used to duplicate.
-
-        ``device_mirror=False`` yields a pinned-only ring (D2H staging);
-        the ring semantics (depth 4, capacity growth, rebuild-restart)
-        live in LwdPinnedStaging and are locked by its table-driven tests.
-        """
-        ring = self._lwd_staging_rings.get(name)
-        if ring is None:
-            ring = LwdPinnedStaging(
-                dtype=dtype,
-                min_capacity=min_capacity,
-                device=self.device if device_mirror else None,
-            )
-            self._lwd_staging_rings[name] = ring
-        return ring

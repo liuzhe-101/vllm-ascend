@@ -3,18 +3,14 @@
 from typing import Any
 
 import torch
-from vllm.utils.torch_utils import PIN_MEMORY
 from vllm.v1.lwd_control.lwd_comm.lwd_link_protocol import LwdRunnerKind
 
-from vllm_ascend.worker.lwd_base_model.lwd_pinned_staging import LwdPinnedStaging
 from vllm_ascend.worker.lwd_base_model.lwd_worker_base import LwdWorkerBase
-from vllm_ascend.worker.lwd_edge_model.lwd_edge_model_runner import (
-    LwdEdgeModelRunner,
-)
+from vllm_ascend.worker.lwd_edge_model.lwd_edge_execution import LwdEdgeExecutionMixin
 from vllm_ascend.worker.v2.model_runner import NPUModelRunner
 
 
-class LwdEdgeModelRunnerV2(LwdEdgeModelRunner, NPUModelRunner):
+class LwdEdgeModelRunnerV2(LwdEdgeExecutionMixin, NPUModelRunner):
     """LWD direct execution with native MRV2 construction and model loading."""
 
     runner_kind: LwdRunnerKind = "v2"
@@ -25,16 +21,9 @@ class LwdEdgeModelRunnerV2(LwdEdgeModelRunner, NPUModelRunner):
         device: torch.device,
         worker: LwdWorkerBase | None = None,
     ) -> None:
-        NPUModelRunner.__init__(self, vllm_config, device)
-        self.worker = worker
-        self.pin_memory = PIN_MEMORY
-        self._lwd_staging_rings: dict[str, LwdPinnedStaging] = {}
+        super().__init__(vllm_config, device)
         self._init_lwd_edge_execution(worker)
 
-    @LwdEdgeModelRunner.use_dcp.setter
-    def use_dcp(self, enabled: bool) -> None:
-        self.dcp_size = self.parallel_config.decode_context_parallel_size if enabled else 1
-
     def load_model(self, *args: Any, **kwargs: Any) -> None:
-        NPUModelRunner.load_model(self, *args, **kwargs)
+        super().load_model(*args, **kwargs)
         self._load_lwd_edge_hash_tables()

@@ -19,6 +19,7 @@ from vllm.v1.lwd_control.lwd_control_diag import LwdControlDiag
 from vllm.v1.outputs import ModelRunnerOutput
 
 from vllm_ascend.worker.lwd_base_model.lwd_worker_base import LwdWorkerBase
+from vllm_ascend.worker.lwd_edge_model.lwd_edge_execution import LwdEdgeExecutionMixin
 from vllm_ascend.worker.lwd_edge_model.lwd_edge_model_runner import (
     LwdEdgeModelRunner,
 )
@@ -30,7 +31,7 @@ if TYPE_CHECKING:
 
 def _resolve_lwd_edge_model_runner_cls(
     use_v2_model_runner: bool,
-) -> type[LwdEdgeModelRunner]:
+) -> type[LwdEdgeExecutionMixin]:
     if use_v2_model_runner:
         from vllm_ascend.worker.lwd_edge_model.v2.model_runner import (
             LwdEdgeModelRunnerV2,

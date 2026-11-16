@@ -25,6 +25,7 @@ import regex as re
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 
 LWD_WORKER_FILES = [
+    "vllm_ascend/worker/lwd_edge_model/lwd_edge_execution.py",
     "vllm_ascend/worker/lwd_edge_model/lwd_edge_worker.py",
     "vllm_ascend/worker/lwd_edge_model/lwd_edge_model_runner.py",
     "vllm_ascend/worker/lwd_edge_model/lwd_edge_mm_cache.py",
@@ -36,6 +37,7 @@ LWD_WORKER_FILES = [
     "vllm_ascend/worker/lwd_cloud_model/lwd_token_rank.py",
     "vllm_ascend/worker/lwd_base_model/lwd_worker_base.py",
     "vllm_ascend/worker/lwd_base_model/lwd_base_model_runner.py",
+    "vllm_ascend/worker/lwd_base_model/lwd_staging_mixin.py",
     "vllm_ascend/worker/lwd_base_model/lwd_pinned_staging.py",
     "vllm_ascend/worker/lwd_hash/lwd_hash_routing.py",
     "vllm_ascend/worker/lwd_hash/lwd_hash_tables.py",
