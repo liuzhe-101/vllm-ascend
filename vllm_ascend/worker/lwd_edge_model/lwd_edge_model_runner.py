@@ -60,15 +60,20 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
         worker: LwdWorkerBase | None = None,
     ) -> None:
         super().__init__(vllm_config, device, worker)
+        self._init_lwd_edge_execution(worker)
+
+    def _init_lwd_edge_execution(self, worker: LwdWorkerBase | None) -> None:
         self.mm_cache = LwdEdgeMmCache()
         self.tid2eid_tables: list[torch.Tensor] = []
         self._lwd_up_send_inflight: dict[int, deque[tuple[int, LwdTransferFuture]]] = {}
         self._lwd_up_send_watermarks: dict[int, int] = {}
 
     def load_model(self) -> None:
-        """Load the edge model and read the CPU Hash routing tables for
-        DeepSeek V4 from the weight files."""
         super().load_model()
+        self._load_lwd_edge_hash_tables()
+
+    def _load_lwd_edge_hash_tables(self) -> None:
+        """Load the DeepSeek V4 CPU Hash routing tables from the checkpoint."""
         # [layer-trace] Parity instrumentation (env-gated, zero overhead
         # when off): the edge install point; cloud and centralized share
         # the same code (see lwd_debug.lwd_layer_trace).
