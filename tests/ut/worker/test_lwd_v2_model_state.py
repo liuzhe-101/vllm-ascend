@@ -1,7 +1,10 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 
+from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 
+import numpy as np
 import torch
 import yaml
 from transformers import Qwen3_5TextConfig
@@ -9,6 +12,7 @@ from vllm.config import VllmConfig
 from vllm.config.device import DeviceConfig
 from vllm.config.lwd import resolve_lwd_config
 from vllm.config.model import ModelConfig
+from vllm.v1.worker.gpu.lwd.cloud_input import LwdCloudBatchView
 from vllm.v1.worker.gpu.lwd.model_state import LwdCloudModelStateMixin
 
 from vllm_ascend.ascend_config import init_ascend_config
@@ -127,3 +131,78 @@ def test_model_specific_state_is_not_replaced_by_lwd_hybrid(tmp_path: Path) -> N
     state_cls = _resolve_ascend_model_state_cls(vllm_config, ModelWithStateOverride())
 
     assert state_cls is AscendMambaHybridModelState
+
+
+class _PromptStage:
+    def __init__(self, host: torch.Tensor) -> None:
+        self.host = host
+        self.consumed = 0
+
+    def take_req(self, req_id: str) -> "_PromptStage":
+        return self
+
+    def recv_rows(self, req_id: str) -> int:
+        return self.host.numel() // 2
+
+    def consumed_rows(self, req_id: str) -> int:
+        return self.consumed
+
+    def segment_for(self, req_id: str, n_rows: int) -> tuple[int, int, int]:
+        return self.consumed * 2, n_rows * 2, 0
+
+    def consume(self, req_id: str, n_rows: int) -> None:
+        self.consumed += n_rows
+
+
+def test_cloud_leader_broadcasts_staged_prompt_window(tmp_path: Path, monkeypatch) -> None:
+    vllm_config = _cloud_config(tmp_path, "full_attention")
+    state = LwdAscendCloudModelState(vllm_config, torch.nn.Module(), None, torch.device("cpu"))
+    stage = _PromptStage(torch.arange(1, 9, dtype=torch.bfloat16))
+    state.bind_lwd_prompt_stage(stage)
+    view = LwdCloudBatchView(
+        req_ids=["r1"],
+        idx_mapping_np=np.array([3]),
+        num_scheduled_tokens=np.array([2], dtype=np.int32),
+        num_computed_tokens_np=np.array([0], dtype=np.int32),
+        prefill_len_np=np.array([4], dtype=np.int32),
+        query_start_loc_np=np.array([0, 2], dtype=np.int32),
+    )
+    broadcasts = []
+
+    def broadcast(tensor, *, src, group, async_op):
+        broadcasts.append((tensor.clone(), src, group, async_op))
+        return SimpleNamespace(wait=lambda: None)
+
+    class _Stream:
+        def wait_event(self, event) -> None:
+            pass
+
+    class _Event:
+        def record(self, stream=None) -> None:
+            pass
+
+    current_stream = _Stream()
+
+    @contextmanager
+    def stream_context(stream) -> None:
+        yield
+
+    monkeypatch.setattr("torch.distributed.broadcast", broadcast)
+    monkeypatch.setattr(
+        "vllm_ascend.worker.lwd_cloud_model.v2.cloud_input.get_tp_group",
+        lambda: SimpleNamespace(world_size=2, ranks=[4, 5], device_group="hccl"),
+    )
+    monkeypatch.setattr("torch.cuda.Stream", lambda device: _Stream())
+    monkeypatch.setattr("torch.cuda.Event", _Event)
+    monkeypatch.setattr("torch.cuda.stream", stream_context)
+    monkeypatch.setattr("torch.cuda.current_stream", lambda: current_stream)
+    inputs_embeds = torch.zeros((2, 2), dtype=torch.bfloat16)
+    next_prompt_embeds = torch.zeros((4, 2), dtype=torch.bfloat16)
+
+    state.lwd_input_assembler.stage_prompt_window(view, inputs_embeds, next_prompt_embeds)
+
+    assert inputs_embeds.tolist() == [[1.0, 2.0], [3.0, 4.0]]
+    assert stage.consumed == 2
+    assert len(broadcasts) == 1
+    assert broadcasts[0][0].tolist() == [1.0, 2.0, 3.0, 4.0]
+    assert broadcasts[0][1:] == (4, "hccl", True)

@@ -72,11 +72,13 @@ class LwdAscendCloudInputAssembler(LwdCloudInputAssembler):
         view: LwdCloudBatchView,
     ) -> LwdStagedWindow:
         if self.prompt_stage is not None:
-            return super()._harvest_window(plan, next_prompt_embeds, view)
+            device_payload, window_index, _ = super()._harvest_window(plan, next_prompt_embeds, view)
+        else:
+            numel = sum(window.rows for window in plan) * self._elements_per_row()
+            device_payload = torch.empty(numel, dtype=torch.bfloat16, device=self.device)
+            window_index = None
         import torch.distributed as dist
 
-        numel = sum(window.rows for window in plan) * self._elements_per_row()
-        device_payload = torch.empty(numel, dtype=torch.bfloat16, device=self.device)
         tp = get_tp_group()
         if tp.world_size > 1:
             dist.broadcast(
@@ -92,7 +94,7 @@ class LwdAscendCloudInputAssembler(LwdCloudInputAssembler):
                     group=tp.device_group,
                     async_op=True,
                 ).wait()
-        return LwdStagedWindow(device_payload, None, plan)
+        return LwdStagedWindow(device_payload, window_index, plan)
 
     def _elements_per_row(self) -> int:
         return self.hidden_size + 4 * self.num_hash_layers * self.num_experts_per_tok
