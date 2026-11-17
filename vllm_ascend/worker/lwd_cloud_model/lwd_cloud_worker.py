@@ -19,6 +19,7 @@ import time
 from typing import TYPE_CHECKING
 
 import torch
+from vllm.distributed.parallel_state import get_tp_group
 from vllm.lwd_logger import lwd_logger
 from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
 
@@ -457,6 +458,15 @@ class LwdCloudWorker(LwdWorkerBase):
         # meta behind the per-step ready event, keeping this worker thread
         # free to prepare and execute subsequent steps.
         payload = self.model_runner.take_lwd_pending_down_payload()
+        tp_group = get_tp_group()
+        lwd_logger.info(
+            "[Lwd][diag] cloud sample rank=%d tp_rank_in_group=%d tp_first_rank=%d payload=%s output=%s",
+            self.rank,
+            getattr(tp_group, "rank_in_group", None),
+            getattr(tp_group, "first_rank", None),
+            payload is not None,
+            type(output).__name__,
+        )
         if payload is not None and output is not None:
             (hidden, meta_dev, seg_lens_host, ready_event, req_ids) = payload
             seqno = self._lwd_next_down_seqno()

@@ -309,7 +309,21 @@ class LwdTransferQueue:
                 keepalive = (req.tensor, req.aux_tensor)
             else:
                 tensor, aux_tensor, handles = self._post_recv(req)
+            logger.info(
+                "[Lwd][diag] channel-post op=%s ch=%s seqno=%s rank=%d",
+                self.op,
+                self.channel_type,
+                req.seqno,
+                dist.get_rank(),
+            )
             done_event = self._bridge_and_record(handles)
+            logger.info(
+                "[Lwd][diag] channel-event op=%s ch=%s seqno=%s rank=%d",
+                self.op,
+                self.channel_type,
+                req.seqno,
+                dist.get_rank(),
+            )
             seed = _lwd_scramble_seed_for(req) if req.op == "recv" else None
             if seed is not None:
                 # `_bridge_and_record` waits on the HCCL handle, so the recv
