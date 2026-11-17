@@ -129,6 +129,9 @@ def test_endpoint_single_source() -> None:
     runner = _RUNNER.read_text(encoding="utf-8")
     assert "edge_npu_count" not in runner, "runner must reuse worker._lwd_early_recv_endpoint, not recompute"
     assert "_lwd_early_recv_endpoint" in runner
+    sample = _segment(_RUNNER, "sample_tokens")
+    assert "get_tp_group().rank_in_group == 0" in sample
+    assert "get_tp_group().is_first_rank" not in sample
 
 
 def test_arrival_harvest_and_mrope_pre_super_order() -> None:

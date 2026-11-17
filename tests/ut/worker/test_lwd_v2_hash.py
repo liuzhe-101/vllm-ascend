@@ -140,7 +140,7 @@ def test_lmhead_tp_captures_trimmed_logits_with_one_projection(monkeypatch) -> N
     monkeypatch.setattr("vllm_ascend.worker.v2.model_runner.lmhead_tp_enable", lambda: True)
     monkeypatch.setattr(
         "vllm.v1.worker.gpu.lwd.model_runner.get_tp_group",
-        lambda: SimpleNamespace(is_first_rank=True),
+        lambda: SimpleNamespace(is_first_rank=False, rank_in_group=0),
     )
     monkeypatch.setattr("torch.cuda.Event", lambda: SimpleNamespace(record=lambda: None))
 
@@ -151,3 +151,4 @@ def test_lmhead_tp_captures_trimmed_logits_with_one_projection(monkeypatch) -> N
     assert captured is not None
     assert captured.tolist() == [[4, 6], [12, 14]]
     assert runner.sampler.call_args.args[0] is captured
+    assert runner.take_lwd_pending_down_payload() is not None

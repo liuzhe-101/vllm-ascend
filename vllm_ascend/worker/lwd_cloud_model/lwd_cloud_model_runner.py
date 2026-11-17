@@ -888,7 +888,7 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         # Only the cloud TP-group first rank (= the DOWN channel endpoint
         # rank) collects/sends; the other ranks have no channel peer, so
         # their collect-and-discard is skipped too (8-card redundancy).
-        wire_endpoint = get_tp_group().is_first_rank
+        wire_endpoint = get_tp_group().rank_in_group == 0
         captured = None
         if wire_endpoint and self.execute_model_state is not None:
             # ExecuteModelState layout (see model_runner_v1.sample_tokens):
