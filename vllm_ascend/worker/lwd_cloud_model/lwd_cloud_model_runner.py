@@ -318,9 +318,7 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
             self.lwd_engram_inputs.plan_step(
                 self._lwd_engram_batch_view(self.input_batch.num_reqs),
                 num_scheduled_tokens,
-                self._lwd_engram_staging(
-                    "engram_row_codes", torch.int32, self.lwd_engram_inputs.row_codes_capacity
-                ),
+                self._lwd_engram_staging("engram_row_codes", torch.int32, self.lwd_engram_inputs.row_codes_capacity),
             )
         return out
 
@@ -719,9 +717,7 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         """
         layout = self._lwd_up_layout_cached
         if layout is None:
-            layout = LwdUpPayloadLayout.from_hf_config(
-                self.model_config.get_hidden_size(), self.model_config.hf_config
-            )
+            layout = LwdUpPayloadLayout.from_hf_config(self.model_config.get_hidden_size(), self.model_config.hf_config)
             self._lwd_up_layout_cached = layout
         return layout
 
@@ -926,12 +922,9 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         torch.npu.current_stream().wait_event(ready_event)
         for window in plan:
             stager.consume(window.req_id, window.rows)
-        lwd_logger.info(
-            "[Lwd][cloud-runner] CONSUME rows=%d reqs=%d stage=%.2fms",
-            sum(window.rows for window in plan),
-            len(plan),
-            (time.monotonic() - started) * 1000,
-        )
+        meter = getattr(self.worker, "_lwd_worker_meter", None)
+        if meter is not None:
+            meter.note_stage(time.monotonic() - started)
 
     def _lwd_h2d_copy_verified(self, dst: torch.Tensor, src: torch.Tensor, rid: str, strict: bool = True) -> None:
         """Pinned-to-device-window H2D copy (sync + read-back check + one retry).
@@ -1071,7 +1064,6 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         if dev is None:
             return
         layout = self.lwd_up_layout()
-        hidden_size = layout.hidden_size
         total_rows = sum(window.rows for window in plan)
         # Same split as the wire payload: the broadcast window is one batch.
         embeds, expert_ids, engram_hashes = layout.unpack(dev, total_rows)
@@ -1288,16 +1280,8 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
                 n_req = sum(1 for i in range(len(batch_req_ids)) if group_valid[i])
                 counts_dev = torch.ones(n_req, dtype=torch.int32, device=logits.device)
                 meta_dev = torch.cat(ranks_list + [counts_dev, counts_dev])
-            selection_done = time.monotonic()
             ready_event = torch.npu.Event()
             ready_event.record()
-            lwd_logger.info(
-                "[Lwd][perf] collect connection=%s rows=%d rank=%.2f total=%.2fms",
-                connection,
-                hidden_packet.shape[0],
-                (selection_done - _t0) * 1000,
-                (time.monotonic() - _t0) * 1000,
-            )
             payloads.append(
                 LwdDownPayload(
                     connection,
@@ -1308,6 +1292,10 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
                     [r for i, r in enumerate(batch_req_ids) if group_valid[i]],
                 )
             )
+        if payloads:
+            meter = getattr(self.worker, "_lwd_worker_meter", None)
+            if meter is not None:
+                meter.note_collect(time.monotonic() - _t0)
         return payloads
 
     def _lwd_pack_plain_down_rows(

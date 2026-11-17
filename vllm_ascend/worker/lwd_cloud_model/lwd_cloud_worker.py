@@ -45,6 +45,7 @@ from vllm_ascend.worker.lwd_cloud_model.lwd_host_stage import (
     LwdHostStager,
     LwdHostStageSlotBusy,
 )
+from vllm_ascend.worker.lwd_debug.lwd_worker_meter import LwdWorkerMeter
 from vllm_ascend.worker.lwd_hash.lwd_up_payload import LwdUpPayloadLayout
 
 if TYPE_CHECKING:
@@ -74,6 +75,7 @@ class LwdCloudWorker(LwdWorkerBase):
 
     def init_device(self) -> None:
         super().init_device()
+        self._lwd_worker_meter = LwdWorkerMeter(f"cloud-rank{self.rank}")
         self._lwd_down_next_seqno: dict[ConnectionId, int] = {}
         self._init_lwd_early_recv_state()
         if self.use_v2_model_runner:
@@ -179,6 +181,7 @@ class LwdCloudWorker(LwdWorkerBase):
     # ------------------------------------------------------------------ #
 
     def execute_model(self, scheduler_output: SchedulerOutput) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
+        started = time.monotonic()
         self._lwd_up_post_recvs(scheduler_output)
 
         # finished_req_ids releases runner and host-stage request state.
@@ -186,7 +189,9 @@ class LwdCloudWorker(LwdWorkerBase):
             self._lwd_cloud_flush_finished(scheduler_output.finished_req_ids)
 
         lwd_get_data_plane().poll_completions()  # lazy keepalive reap
-        return super().execute_model(scheduler_output)
+        output = super().execute_model(scheduler_output)
+        self._lwd_worker_meter.note_execute(time.monotonic() - started)
+        return output
 
     def _lwd_up_post_recvs(self, scheduler_output: SchedulerOutput) -> None:
         """Apply abort notices carried by normal or abort-only scheduler batches."""
@@ -654,21 +659,13 @@ class LwdCloudWorker(LwdWorkerBase):
                 carrier = (meta_dev, seg_lens_host, req_ids, hidden.numel(), seqno, connection)
                 carriers.append(carrier)
                 ready_events[connection] = ready_event
-                lwd_logger.info(
-                    "[Lwd][perf] cloud-step connection=%s seqno=%d sample=%.2f send=%.2f total=%.2fms rows=%d",
-                    connection,
-                    seqno,
-                    (_t_sample - _t0) * 1000,
-                    (time.monotonic() - _t_sample) * 1000,
-                    (time.monotonic() - _t0) * 1000,
-                    hidden.shape[0],
-                )
             if is_driver and output is not None:
                 target = getattr(output, "_model_runner_output", output)
                 target.lwd_down_carriers = carriers
                 # The events belong to this output generation and must be
                 # consumed before the output crosses the process boundary.
                 target.lwd_meta_ready_events = ready_events
+        self._lwd_worker_meter.note_sample(_t_sample - _t0, time.monotonic() - _t_sample)
         return output
 
     # ------------------------------------------------------------------ #
@@ -677,6 +674,7 @@ class LwdCloudWorker(LwdWorkerBase):
 
     def shutdown(self) -> None:
         """Quiesce early receive before closing its data-plane FIFOs."""
+        self._lwd_worker_meter.flush()
         self._lwd_early_recv_stop.set()
         thread = self._lwd_early_recv_thread
         if thread is not None and thread.is_alive() and thread is not threading.current_thread():

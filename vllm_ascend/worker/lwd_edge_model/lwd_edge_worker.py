@@ -52,6 +52,9 @@ class LwdEdgeWorker(LwdWorkerBase):
 
     def shutdown(self) -> None:
         """Release channel FIFOs and HCCL groups before native teardown."""
+        meter = getattr(self.model_runner, "_lwd_worker_meter", None)
+        if meter is not None:
+            meter.flush()
         try:
             self.comm_service.shutdown(timeout=5.0)
             from vllm_ascend.distributed.lwd_data_plane.lwd_channels import (

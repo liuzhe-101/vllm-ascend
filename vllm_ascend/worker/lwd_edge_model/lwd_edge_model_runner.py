@@ -31,6 +31,7 @@ from vllm_ascend.distributed.lwd_data_plane.lwd_types import (
     connection_from,
 )
 from vllm_ascend.worker.lwd_base_model.lwd_base_model_runner import LwdBaseModelRunner
+from vllm_ascend.worker.lwd_debug.lwd_worker_meter import LwdWorkerMeter
 from vllm_ascend.worker.lwd_edge_model.lwd_edge_mm_cache import LwdEdgeMmCache
 from vllm_ascend.worker.lwd_hash.lwd_hash_tables import load_tid2eid_tables
 from vllm_ascend.worker.lwd_hash.lwd_up_payload import LwdUpPayloadLayout
@@ -65,6 +66,7 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
         worker: LwdWorkerBase | None = None,
     ) -> None:
         super().__init__(vllm_config, device, worker)
+        self._lwd_worker_meter = LwdWorkerMeter(f"edge-{device}", edge=True)
         self.mm_cache = LwdEdgeMmCache()
         self.tid2eid_tables: list[torch.Tensor] = []
         self._lwd_up_send_inflight: dict[ConnectionId, deque[tuple[int, LwdTransferFuture]]] = {}
@@ -256,19 +258,8 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
             seqno=seqno,
         )
         self._lwd_submit_up_send(request)
-        # [Lwd][perf] TTFT probes: forward = the embed forward;
-        # submit_send = snapshot clone + broadcast submit (including the
-        # bridge's handle.wait) — if the UP world broadcast is waiting on
-        # the cloud's enqueue, this segment grows visibly (direct evidence
-        # of chunk-level lockstep)
-        lwd_logger.debug(
-            "[Lwd][perf] embed seqno=%s forward=%.2f submit_send=%.2f total=%.2fms tokens=%d",
-            seqno,
-            (_t_fwd - _t0) * 1000,
-            (time.monotonic() - _t_fwd) * 1000,
-            (time.monotonic() - _t0) * 1000,
-            len(flat_token_ids),
-        )
+        # forward = the embed forward; submit_send = UP packaging and submit.
+        self._lwd_worker_meter.note_embed(_t_fwd - _t0, time.monotonic() - _t_fwd)
         return self._lwd_watermarked_output(connection)
 
     def _lwd_build_up_payload(
@@ -403,21 +394,11 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
             sampled_token_ids.append(flat_ids[off : off + accept])
             off += len(ranks)
         _t_sel = time.monotonic()
-        # [Lwd][perf] Temporary probes attributing single-request latency:
-        # post_recv = posting the irecv; wait_tensor = waiting for the
-        # tensor to land (network); lm_head = the vocabulary forward
-        # (weight bandwidth); select = argsort name lookup (.item sync);
-        # total = the whole edge tail
-        lwd_logger.debug(
-            "[Lwd][perf] unembed seqno=%s post_recv=%.2f wait_tensor=%.2f "
-            "lm_head=%.2f select=%.2f total=%.2fms reqs=%d",
-            seqno,
-            (_t_post - _t0) * 1000,
-            (_t_tensor - _t_post) * 1000,
-            (_t_lm - _t_tensor) * 1000,
-            (_t_sel - _t_lm) * 1000,
-            (_t_sel - _t0) * 1000,
-            len(batch_meta.req_ids),
+        self._lwd_worker_meter.note_unembed(
+            _t_post - _t0,
+            _t_tensor - _t_post,
+            _t_lm - _t_tensor,
+            _t_sel - _t_lm,
         )
         output = self._lwd_watermarked_output()
         output.req_ids = batch_meta.req_ids
