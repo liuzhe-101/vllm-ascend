@@ -29,6 +29,16 @@ SPEC = importlib.util.spec_from_file_location("routing", ROOT / "worker/lwd_hash
 routing = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(routing)
 
+# The payload layout imports by package path; register the already-loaded
+# routing module under it so the plugin __init__ stays out of this file.
+sys.modules.setdefault("vllm_ascend.worker.lwd_hash.lwd_hash_routing", routing)
+_LAYOUT_SPEC = importlib.util.spec_from_file_location(
+    "lwd_up_payload", ROOT / "worker/lwd_hash/lwd_up_payload.py"
+)
+up_payload = importlib.util.module_from_spec(_LAYOUT_SPEC)
+sys.modules["lwd_up_payload"] = up_payload
+_LAYOUT_SPEC.loader.exec_module(up_payload)
+
 
 def load_methods(path, names, base=object, extra_classes=(), **globals_):
     """Compile real methods with a stub base to isolate hardware dependencies."""
@@ -51,14 +61,40 @@ RUNNER = "worker/lwd_cloud_model/lwd_cloud_model_runner.py"
 
 class TestHashTransport(unittest.TestCase):
     def test_lossless_ids_above_bf16_integer_precision(self):
+        layout = up_payload.LwdUpPayloadLayout(hidden_size=4, num_hash_layers=1, hash_top_k=2)
         embeds = torch.arange(12).reshape(3, 4).to(torch.bfloat16)
         ids = torch.tensor([0, 257, 511, 1023, 4095, 65535]).reshape(3, 1, 2)
-        payload = routing.pack_hash_payload(embeds, ids)
-        actual_embeds, actual_ids = routing.unpack_hash_payload(payload, 3, 4, 1, 2)
+        payload = layout.pack(embeds, expert_ids=ids)
+        actual_embeds, actual_ids, engram = layout.unpack(payload, 3)
         self.assertTrue(torch.equal(actual_embeds, embeds))
         self.assertTrue(torch.equal(actual_ids, ids))
+        self.assertIsNone(engram)
         with self.assertRaises(ValueError):
-            routing.unpack_hash_payload(payload[:-1], 3, 4, 1, 2)
+            layout.unpack(payload[:-1], 3)
+
+    def test_engram_segment_rides_beside_the_expert_ids(self):
+        """Both tails present: each is carved by its own per-row size."""
+        layout = up_payload.LwdUpPayloadLayout(
+            hidden_size=4, num_hash_layers=1, hash_top_k=2, num_engram_layers=2, num_engram_cols=3
+        )
+        embeds = torch.arange(8).reshape(2, 4).to(torch.bfloat16)
+        ids = torch.tensor([[[1, 2]], [[3, 4]]], dtype=torch.int32)
+        hashes = torch.arange(12).reshape(2, 2, 3).to(torch.int32)
+        payload = layout.pack(embeds, expert_ids=ids, engram_hashes=hashes)
+        self.assertEqual(payload.numel(), layout.numel(2))
+        actual_embeds, actual_ids, actual_hashes = layout.unpack(payload, 2)
+        self.assertTrue(torch.equal(actual_embeds, embeds))
+        self.assertTrue(torch.equal(actual_ids, ids))
+        self.assertTrue(torch.equal(actual_hashes, hashes))
+
+    def test_a_segment_the_layout_does_not_have_is_rejected(self):
+        """Mismatched layouts must fail here, not address wrong rows later."""
+        layout = up_payload.LwdUpPayloadLayout(hidden_size=4)
+        embeds = torch.arange(8).reshape(2, 4).to(torch.bfloat16)
+        with self.assertRaises(ValueError):
+            layout.pack(embeds, expert_ids=torch.ones(2, 1, 2, dtype=torch.int32))
+        with self.assertRaises(ValueError):
+            up_payload.LwdUpPayloadLayout(hidden_size=4, num_hash_layers=1)
 
     def test_reordered_mixed_requests_and_chunk_offsets(self):
         state = routing.LwdHashRoutingState(1, 2, 1024)
@@ -382,11 +418,11 @@ class TestMixedInjection(unittest.TestCase):
                 "_lwd_window_device",
                 "_lwd_stage_one_request",
                 "_lwd_h2d_copy_verified",
-                "_lwd_hash_dims",
                 "_lwd_inject_remote_embeds",
                 "_lwd_decode_expert_ids",
                 "_lwd_prime_mrope_positions",
                 "_lwd_prepare_hash_batch",
+                "lwd_up_layout",
             },
             base=Base,
             extra_classes=("LwdPromptWindow", "LwdUpWindow"),
@@ -396,6 +432,7 @@ class TestMixedInjection(unittest.TestCase):
             SchedulerOutput=object,
             SpecDecodeMetadata=object,
             LwdHostStager=object,
+            LwdUpPayloadLayout=up_payload.LwdUpPayloadLayout,
             parse_edge_id=lambda req_id: ("edge", req_id),
             get_tp_group=lambda: self.runner._fake_tp_group,
             dist=NS(
@@ -410,7 +447,6 @@ class TestMixedInjection(unittest.TestCase):
 
         self.connection = FakeConnection("edge")
         self.runner._fake_tp_group = NS(world_size=1)
-        self.runner._lwd_hash_dims_cached = None
         self.a_embeds = torch.arange(8).reshape(4, 2).to(torch.bfloat16)
         self.b_embeds = (torch.arange(4) + 20).reshape(2, 2).to(torch.bfloat16)
         self.a_ids = torch.tensor(
@@ -440,10 +476,13 @@ class TestMixedInjection(unittest.TestCase):
         )
         self.runner.device = torch.device("cpu")
         self.runner.vllm_config = NS(scheduler_config=NS(max_num_batched_tokens=8))
-        self.runner.model_config = NS(
-            get_hidden_size=lambda: 2,
-            hf_config=NS(model_type="deepseek_v4", num_hash_layers=1, num_experts_per_tok=2),
-        )
+        # `get_hf_text_config` asks the config for its text sub-config; a pure
+        # text model answers with itself.
+        hf_config = NS(model_type="deepseek_v4", num_hash_layers=1, num_experts_per_tok=2)
+        hf_config.get_text_config = lambda: hf_config
+        self.runner.model_config = NS(get_hidden_size=lambda: 2, hf_config=hf_config)
+        # Class attribute on the real runner; load_methods keeps only methods.
+        self.runner._lwd_up_layout_cached = None
         self.runner.input_batch = NS(
             num_reqs=3,
             req_ids=["a", "decode", "b"],
