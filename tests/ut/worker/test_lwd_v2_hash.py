@@ -152,3 +152,51 @@ def test_lmhead_tp_captures_trimmed_logits_with_one_projection(monkeypatch) -> N
     assert captured.tolist() == [[4, 6], [12, 14]]
     assert runner.sampler.call_args.args[0] is captured
     assert runner.take_lwd_pending_down_payload() is not None
+
+
+def test_lwd_sample_uses_num_sampled_to_mask_rejected_tail(monkeypatch) -> None:
+    original_empty = torch.empty
+
+    def empty_without_pin(*args, **kwargs):
+        kwargs.pop("pin_memory", None)
+        return original_empty(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "empty", empty_without_pin)
+    runner = LwdAscendCloudModelRunnerV2.__new__(LwdAscendCloudModelRunnerV2)
+    state = LwdAscendCloudModelState.__new__(LwdAscendCloudModelState)
+    state.model = _Model()
+    state._lwd_sample_logits = None
+    runner.model_state = state
+    runner._lwd_down_builder = LwdDownPayloadBuilder(torch.device("cpu"))
+    sampler_output = SamplerOutput(
+        sampled_token_ids=torch.tensor([[1, 99, 0]]),
+        logprobs_tensors=None,
+        num_nans=None,
+        num_sampled=torch.tensor([1], dtype=torch.int32),
+        num_rejected=torch.tensor([2], dtype=torch.int32),
+    )
+    runner.sampler = Mock()
+    runner.rejection_sampler = Mock(return_value=sampler_output)
+    runner.speculator = SimpleNamespace(draft_logits=object())
+    runner.batch_sharder = None
+    batch = SimpleNamespace(
+        logits_indices=torch.tensor([0, 1, 2]),
+        req_ids=["a"],
+        idx_mapping_np=np.array([0]),
+        num_reqs=1,
+        num_draft_tokens=2,
+        num_draft_tokens_per_req=np.array([2], dtype=np.int32),
+    )
+    monkeypatch.setattr(
+        "vllm.v1.worker.gpu.lwd.model_runner.get_tp_group",
+        lambda: SimpleNamespace(rank_in_group=0),
+    )
+    monkeypatch.setattr("torch.cuda.Event", lambda: SimpleNamespace(record=lambda: None))
+
+    runner.sample(torch.arange(6).view(3, 2), batch, None)
+
+    payload = runner.take_lwd_pending_down_payload()
+    assert payload is not None
+    assert payload.meta_dev.tolist() == [0, 0, 0, 1]
+    assert payload.seg_lens_host == [3]
+    assert sampler_output.sampled_token_ids.tolist() == [[1, 99, 0]]
