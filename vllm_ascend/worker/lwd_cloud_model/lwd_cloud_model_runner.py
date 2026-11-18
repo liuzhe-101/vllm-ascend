@@ -282,45 +282,81 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         num_scheduled_tokens: np.ndarray,
     ) -> tuple[torch.Tensor, SpecDecodeMetadata | None, int]:
         """Prime full-prompt M-RoPE and harvest arrivals before native preparation."""
-        for new_req in scheduler_output.scheduled_new_reqs:
-            spans = list(new_req.lwd_image_placeholder_spans)
-            lwd_check_image_placeholder_spans(new_req.req_id, spans, self.lwd_engram_inputs is not None)
-            if spans:
-                self._lwd_image_spans[new_req.req_id] = spans
-            payload = new_req.lwd_mrope_positions or b""
-            if not payload:
-                continue
-            prompt_len = new_req.prompt_len
-            if prompt_len <= 0:
-                raise RuntimeError(f"[Lwd][cloud-runner] mrope prime req={new_req.req_id}: prompt length is missing")
-            self._lwd_prime_mrope_positions(new_req.req_id, payload, prompt_len)
-        windows = self._lwd_harvest_up_batches(num_scheduled_tokens, scheduler_output)
-        # Native placeholder assembly contains only zeros. Skip its redundant
-        # host copy and H2D; the arrival window below is authoritative.
-        embeds_map = self.input_batch.req_prompt_embeds
-        self.input_batch.req_prompt_embeds = {}
+        prepare_started = time.monotonic()
+        up_harvest = 0.0
+        native_prepare = 0.0
+        inject = 0.0
+        hash_engram_prepare = 0.0
+        meter = getattr(getattr(self, "worker", None), "_lwd_worker_meter", None)
         try:
-            out = super()._prepare_inputs(scheduler_output, num_scheduled_tokens)
+            for new_req in scheduler_output.scheduled_new_reqs:
+                spans = list(new_req.lwd_image_placeholder_spans)
+                lwd_check_image_placeholder_spans(new_req.req_id, spans, self.lwd_engram_inputs is not None)
+                if spans:
+                    self._lwd_image_spans[new_req.req_id] = spans
+                payload = new_req.lwd_mrope_positions or b""
+                if not payload:
+                    continue
+                prompt_len = new_req.prompt_len
+                if prompt_len <= 0:
+                    raise RuntimeError(
+                        f"[Lwd][cloud-runner] mrope prime req={new_req.req_id}: prompt length is missing"
+                    )
+                self._lwd_prime_mrope_positions(new_req.req_id, payload, prompt_len)
+            harvest_started = time.monotonic()
+            try:
+                windows = self._lwd_harvest_up_batches(num_scheduled_tokens, scheduler_output)
+            finally:
+                up_harvest = time.monotonic() - harvest_started
+            # Native placeholder assembly contains only zeros. Skip its redundant
+            # host copy and H2D; the arrival window below is authoritative.
+            embeds_map = self.input_batch.req_prompt_embeds
+            self.input_batch.req_prompt_embeds = {}
+            native_prepare_started = time.monotonic()
+            try:
+                try:
+                    out = super()._prepare_inputs(scheduler_output, num_scheduled_tokens)
+                finally:
+                    self.input_batch.req_prompt_embeds = embeds_map
+            finally:
+                native_prepare = time.monotonic() - native_prepare_started
+            self._lwd_rebuild_is_token_ids_mask(num_scheduled_tokens)
+            self._lwd_release_consumed_prompt_embeds()
+            inject_started = time.monotonic()
+            try:
+                for window in windows:
+                    self._lwd_inject_remote_embeds(
+                        window.dev,
+                        window.win_idx,
+                        window.plan,
+                        num_scheduled_tokens,
+                    )
+            finally:
+                inject = time.monotonic() - inject_started
+            hash_engram_started = time.monotonic()
+            try:
+                if self.lwd_hash_state is not None:
+                    self._lwd_prepare_hash_batch(num_scheduled_tokens)
+                if self.lwd_engram_inputs is not None:
+                    self.lwd_engram_inputs.plan_step(
+                        self._lwd_engram_batch_view(self.input_batch.num_reqs),
+                        num_scheduled_tokens,
+                        self._lwd_engram_staging(
+                            "engram_row_codes", torch.int32, self.lwd_engram_inputs.row_codes_capacity
+                        ),
+                    )
+            finally:
+                hash_engram_prepare = time.monotonic() - hash_engram_started
+            return out
         finally:
-            self.input_batch.req_prompt_embeds = embeds_map
-        self._lwd_rebuild_is_token_ids_mask(num_scheduled_tokens)
-        self._lwd_release_consumed_prompt_embeds()
-        for window in windows:
-            self._lwd_inject_remote_embeds(
-                window.dev,
-                window.win_idx,
-                window.plan,
-                num_scheduled_tokens,
-            )
-        if self.lwd_hash_state is not None:
-            self._lwd_prepare_hash_batch(num_scheduled_tokens)
-        if self.lwd_engram_inputs is not None:
-            self.lwd_engram_inputs.plan_step(
-                self._lwd_engram_batch_view(self.input_batch.num_reqs),
-                num_scheduled_tokens,
-                self._lwd_engram_staging("engram_row_codes", torch.int32, self.lwd_engram_inputs.row_codes_capacity),
-            )
-        return out
+            if meter is not None:
+                meter.note_prepare(
+                    time.monotonic() - prepare_started,
+                    up_harvest,
+                    native_prepare,
+                    inject,
+                    hash_engram_prepare,
+                )
 
     def _lwd_engram_batch_view(self, num_reqs: int) -> LwdEngramBatchView:
         return LwdEngramBatchView(
@@ -659,55 +695,61 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         **model_kwargs,
     ) -> torch.Tensor:
         """Publish the full Hash routing data into the forward context."""
-        context = get_forward_context()
-        if self.lwd_hash_state is not None:
-            # Initialize the routing index cache first so padded rows use the legal zero index.
-            self._lwd_hash_token_ids.zero_()
-            if self._lwd_hash_step_tokens is None:
-                # Synthetic forwards have no remote prompt; route dummy token 0.
-                self._lwd_hash_prompt_mask.zero_()
-            else:
-                count = self._lwd_hash_step_tokens
-                if count > num_tokens_padded:
-                    raise ValueError("LWD Hash routing rows exceed model input rows")
-                # Native input preparation retains real decode IDs even when
-                # model input_ids=None because the model consumes embeddings.
-                self._lwd_hash_token_ids[:count].copy_(self.input_ids.gpu[:count])
-            context.input_ids = self._lwd_hash_token_ids[:num_tokens_padded]
-            context.lwd_hash_expert_ids = self._lwd_hash_experts[:num_tokens_padded]
-            context.lwd_hash_prompt_mask = self._lwd_hash_prompt_mask[:num_tokens_padded]
-            if input_ids is None:
-                # Covers the dummy/profile run: with enable_prompt_embeds it
-                # also takes the inputs_embeds branch (input_ids=None), and
-                # the model-layer hash fail-fast rejects None before the
-                # router's dummy-token-0 path can run. Same contract as the
-                # request-side placeholder: all zeros, never read (the
-                # router swaps in row indices).
-                input_ids = self._lwd_hash_placeholder_ids[:num_tokens_padded]
-        engram = self.lwd_engram_inputs
-        if engram is None:
-            return super()._model_forward(
-                num_tokens_padded,
-                input_ids,
-                positions,
-                intermediate_tensors,
-                inputs_embeds,
-                **model_kwargs,
-            )
-        # MoE bias_vl and the Engram dead mask read ids on every row, so the
-        # cloud's placeholder prompt ids are replaced by public values.
-        input_ids = engram.model_input_ids(self.input_ids.gpu, num_tokens_padded)
+        meter = getattr(getattr(self, "worker", None), "_lwd_worker_meter", None)
+        forward_started = time.monotonic() if meter is not None else 0.0
         try:
-            return super()._model_forward(
-                num_tokens_padded,
-                input_ids,
-                positions,
-                intermediate_tensors,
-                inputs_embeds,
-                **model_kwargs,
-            )
+            context = get_forward_context()
+            if self.lwd_hash_state is not None:
+                # Initialize the routing index cache first so padded rows use the legal zero index.
+                self._lwd_hash_token_ids.zero_()
+                if self._lwd_hash_step_tokens is None:
+                    # Synthetic forwards have no remote prompt; route dummy token 0.
+                    self._lwd_hash_prompt_mask.zero_()
+                else:
+                    count = self._lwd_hash_step_tokens
+                    if count > num_tokens_padded:
+                        raise ValueError("LWD Hash routing rows exceed model input rows")
+                    # Native input preparation retains real decode IDs even when
+                    # model input_ids=None because the model consumes embeddings.
+                    self._lwd_hash_token_ids[:count].copy_(self.input_ids.gpu[:count])
+                context.input_ids = self._lwd_hash_token_ids[:num_tokens_padded]
+                context.lwd_hash_expert_ids = self._lwd_hash_experts[:num_tokens_padded]
+                context.lwd_hash_prompt_mask = self._lwd_hash_prompt_mask[:num_tokens_padded]
+                if input_ids is None:
+                    # Covers the dummy/profile run: with enable_prompt_embeds it
+                    # also takes the inputs_embeds branch (input_ids=None), and
+                    # the model-layer hash fail-fast rejects None before the
+                    # router's dummy-token-0 path can run. Same contract as the
+                    # request-side placeholder: all zeros, never read (the
+                    # router swaps in row indices).
+                    input_ids = self._lwd_hash_placeholder_ids[:num_tokens_padded]
+            engram = self.lwd_engram_inputs
+            if engram is None:
+                return super()._model_forward(
+                    num_tokens_padded,
+                    input_ids,
+                    positions,
+                    intermediate_tensors,
+                    inputs_embeds,
+                    **model_kwargs,
+                )
+            # MoE bias_vl and the Engram dead mask read ids on every row, so the
+            # cloud's placeholder prompt ids are replaced by public values.
+            input_ids = engram.model_input_ids(self.input_ids.gpu, num_tokens_padded)
+            try:
+                return super()._model_forward(
+                    num_tokens_padded,
+                    input_ids,
+                    positions,
+                    intermediate_tensors,
+                    inputs_embeds,
+                    **model_kwargs,
+                )
+            finally:
+                engram.end_step()
         finally:
-            engram.end_step()
+            if meter is not None:
+                meter.note_forward(time.monotonic() - forward_started)
 
     def lwd_up_layout(self) -> LwdUpPayloadLayout:
         """UP payload layout of this model, cached at first use.
@@ -1189,7 +1231,13 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
                 self.discard_request_mask.np.copy(),
             )
         self._lwd_captured_sampler_output = None
-        output = super().sample_tokens(grammar_output)
+        meter = getattr(getattr(self, "worker", None), "_lwd_worker_meter", None)
+        native_sample_started = time.monotonic() if meter is not None else 0.0
+        try:
+            output = super().sample_tokens(grammar_output)
+        finally:
+            if meter is not None:
+                meter.note_native_sample(time.monotonic() - native_sample_started)
         if captured is not None and self._lwd_captured_sampler_output is not None:
             payload = self._lwd_collect_down_payload(
                 captured[0],

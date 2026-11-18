@@ -182,6 +182,9 @@ class LwdCloudWorker(LwdWorkerBase):
 
     def execute_model(self, scheduler_output: SchedulerOutput) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
         started = time.monotonic()
+        meter = getattr(self, "_lwd_worker_meter", None)
+        if meter is not None:
+            meter.begin_execute()
         self._lwd_up_post_recvs(scheduler_output)
 
         # finished_req_ids releases runner and host-stage request state.
@@ -190,7 +193,8 @@ class LwdCloudWorker(LwdWorkerBase):
 
         lwd_get_data_plane().poll_completions()  # lazy keepalive reap
         output = super().execute_model(scheduler_output)
-        self._lwd_worker_meter.note_execute(time.monotonic() - started)
+        if meter is not None:
+            meter.note_execute(time.monotonic() - started)
         return output
 
     def _lwd_up_post_recvs(self, scheduler_output: SchedulerOutput) -> None:
