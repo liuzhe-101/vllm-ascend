@@ -934,7 +934,7 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         )
 
     def _lwd_h2d_copy_verified(self, dst: torch.Tensor, src: torch.Tensor, rid: str, strict: bool = True) -> None:
-        """Pinned-to-device-window H2D copy (sync + read-back check + one retry).
+        """Verify the first H2D copy on a stream, then copy asynchronously.
 
         Root-cause fix for the 2E2C cold-start first window (2026-11, ported
         from cr_mi_to_23.0_azy_1029_memc b471c205b): right after a segmented
@@ -951,9 +951,9 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         The check compares the first 16 destination elements with the same
         source elements, including matching NaNs. All-zero and zero-sum data
         therefore pass. ``strict=False`` is for the expert-ID tail: retry a
-        mismatch once, but never fail; the retry is idempotent. The standing
-        cost is one blocking copy plus a bounded sample comparison on the H2D
-        stream.
+        mismatch once, but never fail; the retry is idempotent. Only the first
+        successful copy on each stream pays the synchronous verification cost;
+        subsequent copies restore asynchronous H2D overlap.
 
         Sync scope: the read-back only needs the *issuing* stream drained,
         which the blocking ``copy_`` already guarantees, so a stream-level
@@ -965,6 +965,9 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         early-recv HCCL ops) at each staging point with no correctness
         gain, and is deliberately avoided here.
         """
+        if getattr(self, "_lwd_h2d_copy_warmed", False):
+            dst.copy_(src, non_blocking=True)
+            return
         dst.copy_(src, non_blocking=False)
         torch.npu.current_stream().synchronize()
         dst_sample = dst[:_LWD_H2D_VERIFY_ELEMENTS]
@@ -986,6 +989,7 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
             return False
 
         if samples_match():
+            self._lwd_h2d_copy_warmed = True
             return
         lwd_logger.warning(
             "[LWD][cloud-runner] H2D first-copy mismatch req=%s (sample differs after sync copy; retrying)",
@@ -993,7 +997,9 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         )
         dst.copy_(src, non_blocking=False)
         torch.npu.current_stream().synchronize()
-        if strict and not samples_match():
+        if samples_match():
+            self._lwd_h2d_copy_warmed = True
+        elif strict:
             raise RuntimeError(
                 f"[LWD][cloud-runner] H2D copy mismatch twice req={rid} "
                 "(source and destination samples differ after retry)"
@@ -1005,6 +1011,7 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         if stream is None:
             stream = torch.npu.Stream()
             self._lwd_h2d_copy_stream = stream
+            self._lwd_h2d_copy_warmed = False
         return stream
 
     def _lwd_window_device(self, numel: int, min_depth: int = _LWD_WINDOW_MIN_DEPTH) -> tuple[torch.Tensor, int]:
