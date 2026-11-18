@@ -44,18 +44,6 @@ if TYPE_CHECKING:
     from vllm_ascend.worker.lwd_base_model.lwd_worker_base import LwdWorkerBase
 
 
-def select_token_batch(logits: torch.Tensor, ranks: list[int]) -> list[int]:
-    """Batched rank→token lookup: one sort, one D2H sync for all rows.
-
-    logits [R,V] rows sorted together (NPU sorts rows in parallel);
-    sorted_idx[i, ranks[i]] is the token id at rank ranks[i] for row i.
-    Stable sorting preserves ascending token-ID order for equal logits.
-    """
-    _, sorted_idx = torch.sort(logits, dim=-1, descending=True, stable=True)
-    row = torch.arange(len(ranks), device=logits.device)
-    return sorted_idx[row, torch.tensor(ranks, device=logits.device)].tolist()
-
-
 class LwdEdgeModelRunner(LwdBaseModelRunner):
     """Embed + unembed compute for the LWD edge (no native step pipeline)."""
 
@@ -333,7 +321,6 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
 
     @torch.inference_mode()
     def execute_lwd_unembed(self, seqno: int, batch_meta: LwdUnembedBatch) -> ModelRunnerOutput:
-        model = self.get_model()
         connection = connection_from(batch_meta)
         if not batch_meta.req_ids:
             return self._lwd_watermarked_output()
@@ -353,41 +340,12 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
         _t_post = time.monotonic()
         # wait_on_current_stream: device-ordered wait; the host never blocks
         recv_future.wait_on_current_stream()
-        result = recv_future.result()
-        # The receive tensor was allocated on the channel stream but is
-        # consumed by lm_head on the compute stream. Keep its allocation
-        # alive until that stream's work completes, including after the
-        # future and its local result leave scope.
-        result.tensor.record_stream(torch.npu.current_stream())
+        _result = recv_future.result()
+        # Ablation: preserve DOWN receive/backpressure while bypassing all edge
+        # lm_head and rank-selection compute. Output is intentionally invalid.
         _t_tensor = time.monotonic()
-        hidden_size = self.model_config.get_hidden_size()
-        hidden_states = result.tensor.view(-1, hidden_size)  # (rows_total, H)
-        # lm_head must not be called directly (ParallelLMHead.forward
-        # forces the sampler path); compute_logits is the standard
-        # interface present on both wrapper and monolithic models.
-        logits = model.compute_logits(hidden_states)  # (rows_total, V)
         _t_lm = time.monotonic()
-        # L5 parity check: the first row's top-20 compared entrywise
-        # against the cloud sampler's [layer-trace] top-20 — any rank
-        # swap is a direct view of replay drift.
-        try:
-            from vllm_ascend.worker.lwd_debug.lwd_layer_trace import (
-                lwd_layer_trace_enabled,
-            )
-
-            if lwd_layer_trace_enabled() and logits.dim() == 2:
-                row = logits[0].detach().float()
-                vals, tids = torch.topk(row, min(20, row.numel()))
-                lwd_logger.info(
-                    "[layer-trace] edge lm_head logits shape=%s row0 l2=%.4f top20=%s",
-                    tuple(logits.shape),
-                    row.norm().item(),
-                    list(zip(tids.tolist(), [round(v, 3) for v in vals.tolist()])),
-                )
-        except Exception:  # noqa: BLE001
-            pass
-
-        flat_ids = select_token_batch(logits, [r for ranks in batch_meta.top_id_ths for r in ranks])
+        flat_ids = [0] * sum(len(ranks) for ranks in batch_meta.top_id_ths)
         sampled_token_ids = []
         off = 0
         for accept, ranks in zip(batch_meta.num_accept_tokens, batch_meta.top_id_ths):
