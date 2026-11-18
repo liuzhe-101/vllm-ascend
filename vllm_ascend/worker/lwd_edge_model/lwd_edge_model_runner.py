@@ -69,8 +69,8 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
         self.tid2eid_tables: list[torch.Tensor] = []
         self._lwd_up_send_inflight: dict[ConnectionId, deque[tuple[int, LwdTransferFuture]]] = {}
         self._lwd_up_send_watermarks: dict[ConnectionId, int] = {}
-        # Built from the original checkpoint config: the edge projection
-        # clears the Engram fields from this process's model config.
+        # Read the original checkpoint config directly: the cloud holds the
+        # Engram tables, while the edge only needs their hash layout.
         self.engram_hasher = LwdEngramHasher.from_model_config(self.model_config)
         self.up_payload_layout = LwdUpPayloadLayout(self.model_config.get_hidden_size())
         # Full prompt ids per request on CPU: a chunk's Engram look-back
