@@ -873,6 +873,7 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
                 dev = torch.empty(numel, dtype=torch.bfloat16, device=self.device)
                 win_idx = None
             if tp.world_size > 1:
+                broadcast_started = time.monotonic()
                 work = dist.broadcast(
                     dev,
                     src=worker._lwd_up_src_ranks[connection],
@@ -880,6 +881,9 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
                     async_op=True,
                 )
                 work.wait()
+                meter = getattr(worker, "_lwd_worker_meter", None)
+                if meter is not None:
+                    meter.note_execution_part("up_broadcast", time.monotonic() - broadcast_started)
             windows.append(LwdUpWindow(connection, dev, win_idx, connection_plan))
         return windows
 
@@ -1000,8 +1004,15 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         early-recv HCCL ops) at each staging point with no correctness
         gain, and is deliberately avoided here.
         """
+        meter = getattr(getattr(self, "worker", None), "_lwd_worker_meter", None)
+        copy_started = time.monotonic()
         dst.copy_(src, non_blocking=False)
+        copy_done = time.monotonic()
         torch.npu.current_stream().synchronize()
+        sync_done = time.monotonic()
+        copy_s = copy_done - copy_started
+        sync_s = sync_done - copy_done
+        verify_s = 0.0
         dst_sample = dst[:_LWD_H2D_VERIFY_ELEMENTS]
         src_sample = src[:_LWD_H2D_VERIFY_ELEMENTS]
 
@@ -1020,15 +1031,32 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
                 return bool(torch.all((dst_cpu == src_cpu) | (torch.isnan(dst_cpu) & torch.isnan(src_cpu))).item())
             return False
 
+        verify_started = time.monotonic()
         if samples_match():
+            if meter is not None:
+                meter.note_stage_part("stage_copy", copy_s)
+                meter.note_stage_part("stage_sync", sync_s)
+                meter.note_stage_part("stage_verify", time.monotonic() - verify_started)
             return
+        verify_s += time.monotonic() - verify_started
         lwd_logger.warning(
             "[LWD][cloud-runner] H2D first-copy mismatch req=%s (sample differs after sync copy; retrying)",
             rid,
         )
+        retry_started = time.monotonic()
         dst.copy_(src, non_blocking=False)
+        copy_s += time.monotonic() - retry_started
+        sync_started = time.monotonic()
         torch.npu.current_stream().synchronize()
-        if strict and not samples_match():
+        sync_s += time.monotonic() - sync_started
+        verify_started = time.monotonic()
+        verified = samples_match()
+        verify_s += time.monotonic() - verify_started
+        if meter is not None:
+            meter.note_stage_part("stage_copy", copy_s)
+            meter.note_stage_part("stage_sync", sync_s)
+            meter.note_stage_part("stage_verify", verify_s)
+        if strict and not verified:
             raise RuntimeError(
                 f"[LWD][cloud-runner] H2D copy mismatch twice req={rid} "
                 "(source and destination samples differ after retry)"
@@ -1232,6 +1260,8 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
             )
         self._lwd_captured_sampler_output = None
         meter = getattr(getattr(self, "worker", None), "_lwd_worker_meter", None)
+        if meter is not None:
+            meter.begin_sample()
         native_sample_started = time.monotonic() if meter is not None else 0.0
         try:
             output = super().sample_tokens(grammar_output)

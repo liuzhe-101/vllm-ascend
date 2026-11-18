@@ -1460,7 +1460,11 @@ class NPUModelRunner(GPUModelRunner):
         self.query_start_loc.gpu[num_reqs + 1 :].fill_(-1)
 
         # Copy the tensors to the NPU.
+        meter = getattr(getattr(self, "worker", None), "_lwd_worker_meter", None)
+        started = time.monotonic()
         self._prepare_input_ids(scheduler_output, num_reqs, total_num_scheduled_tokens, cu_num_tokens)
+        if meter is not None:
+            meter.note_prepare_detail("input_ids_prepare", time.monotonic() - started)
         # Calculate M-RoPE positions.
         # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
         if self.uses_mrope:
@@ -1490,7 +1494,11 @@ class NPUModelRunner(GPUModelRunner):
         # Sync num_accepted_tokens from CPU (set by
         # _update_states_after_model_execute for hybrid models).
         if self.num_accepted_tokens_event is not None:
+            meter = getattr(getattr(self, "worker", None), "_lwd_worker_meter", None)
+            started = time.monotonic()
             self.num_accepted_tokens_event.synchronize()
+            if meter is not None:
+                meter.note_prepare_detail("accepted_event_wait", time.monotonic() - started)
             self._sync_num_accepted_tokens(
                 num_reqs, has_prev_mapping=bool(prev_req_id_to_index)
             )
@@ -1664,10 +1672,13 @@ class NPUModelRunner(GPUModelRunner):
                 else:
                     num_decode_draft_tokens[req_idx] = -1
 
+            spec_started = time.monotonic()
             spec_decode_metadata = self._calc_spec_decode_metadata(
                 num_draft_tokens,
                 cu_num_tokens,
             )
+            if meter is not None:
+                meter.note_prepare_detail("spec_metadata", time.monotonic() - spec_started)
             logits_indices = spec_decode_metadata.logits_indices
             num_sampled_tokens = num_draft_tokens + 1
 
@@ -1862,7 +1873,11 @@ class NPUModelRunner(GPUModelRunner):
         """
         assert self.valid_sampled_token_count_event is not None
         assert self.valid_sampled_token_count_cpu is not None
+        meter = getattr(getattr(self, "worker", None), "_lwd_worker_meter", None)
+        started = time.monotonic()
         self.valid_sampled_token_count_event.synchronize()
+        if meter is not None:
+            meter.note_prepare_detail("valid_count_event_wait", time.monotonic() - started)
         correct_optimistic_seq_lens_cpu(
             self.optimistic_seq_lens_cpu.numpy(),
             self.prev_positions.np,
@@ -2304,9 +2319,11 @@ class NPUModelRunner(GPUModelRunner):
                             req_state.prev_num_draft_len = 0
 
                 # Update persistent batch states.
-                deferred_state_corrections_fn = self._update_states(
-                    scheduler_output
-                )
+                meter = getattr(getattr(self, "worker", None), "_lwd_worker_meter", None)
+                update_started = time.monotonic()
+                deferred_state_corrections_fn = self._update_states(scheduler_output)
+                if meter is not None:
+                    meter.note_execution_part("update_states", time.monotonic() - update_started)
 
                 if has_ec_transfer() and not get_ec_transfer().is_consumer:
                     self._start_dump_data(scheduled_tokens = scheduler_output.num_scheduled_tokens)
@@ -2490,6 +2507,7 @@ class NPUModelRunner(GPUModelRunner):
                         batch_desc.num_reqs,
                     )
 
+                attn_started = time.monotonic()
                 (attn_metadata, spec_decode_common_attn_metadata) = self._build_attention_metadata(
                     num_tokens=num_tokens_unpadded,
                     num_tokens_padded=num_tokens_padded,
@@ -2505,6 +2523,8 @@ class NPUModelRunner(GPUModelRunner):
                     cudagraph_runtime_mode=cudagraph_mode,
                     batch_descriptor=batch_desc,
                 )
+                if meter is not None:
+                    meter.note_execution_part("attention_metadata", time.monotonic() - attn_started)
 
                 self._sanitize_placeholder_input_ids_for_forward(
                     scheduler_output,
@@ -2631,7 +2651,10 @@ class NPUModelRunner(GPUModelRunner):
                     return output
 
                 sample_hidden_states = hidden_states[logits_indices]
+                logits_started = time.monotonic()
                 logits = self.model.compute_logits(sample_hidden_states)
+                if meter is not None:
+                    meter.note_execution_part("logits", time.monotonic() - logits_started)
             else:
                 # Rare case.
                 assert not self.is_pooling_model
@@ -2642,7 +2665,10 @@ class NPUModelRunner(GPUModelRunner):
                     logits = None
                 else:
                     sample_hidden_states = hidden_states[logits_indices]
+                    logits_started = time.monotonic()
                     logits = self.model.compute_logits(sample_hidden_states)
+                    if meter is not None:
+                        meter.note_execution_part("logits", time.monotonic() - logits_started)
 
                 model_output_broadcast_data: dict[str, Any] = {}
                 if logits is not None:
@@ -2763,6 +2789,7 @@ class NPUModelRunner(GPUModelRunner):
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
+        meter = getattr(getattr(self, "worker", None), "_lwd_worker_meter", None)
         kv_connector_output = self.kv_connector_output
         self.kv_connector_output = None
         pp = get_pp_group()
@@ -2809,7 +2836,10 @@ class NPUModelRunner(GPUModelRunner):
             logits = logits.to(self.device).to(logits_dtype)
 
         with record_function_or_nullcontext("sample_token"):
+            sample_started = time.monotonic()
             sampler_output = self._sample(logits, spec_decode_metadata)
+            if meter is not None:
+                meter.note_sample_part("sample_kernel", time.monotonic() - sample_started)
 
         if self.need_accepted_tokens:
             if self.sampling_done_event is None:
@@ -2847,6 +2877,12 @@ class NPUModelRunner(GPUModelRunner):
             )
             self._copy_draft_token_ids_to_cpu(scheduler_output)
 
+        def propose_draft_token_ids_timed(sampled_token_ids):
+            draft_started = time.monotonic()
+            propose_draft_token_ids(sampled_token_ids)
+            if meter is not None:
+                meter.note_sample_part("draft_propose", time.monotonic() - draft_started)
+
         output_spec_token_ids = None
         use_padded_batch = False
         early_pp_padded_drafter = False
@@ -2866,8 +2902,9 @@ class NPUModelRunner(GPUModelRunner):
                 self._draft_token_ids = None
                 self._draft_token_req_ids = None
                 with record_function_or_nullcontext("draft_token"):
-                    propose_draft_token_ids(sampler_output.sampled_token_ids)
+                    propose_draft_token_ids_timed(sampler_output.sampled_token_ids)
 
+        bookkeeping_started = time.monotonic()
         (
             num_nans_in_logits,
             num_nans_device,
@@ -2885,6 +2922,8 @@ class NPUModelRunner(GPUModelRunner):
             scheduler_output.total_num_scheduled_tokens,
             spec_decode_metadata,
         )
+        if meter is not None:
+            meter.note_sample_part("bookkeeping", time.monotonic() - bookkeeping_started)
 
         with record_function_or_nullcontext("draft_token"):
             if self.speculative_config:
@@ -2894,11 +2933,11 @@ class NPUModelRunner(GPUModelRunner):
                 if use_padded_batch and not early_pp_padded_drafter:
                     # EAGLE speculative decoding can use the GPU sampled tokens
                     # as inputs, and does not need to wait for bookkeeping to finish.
-                    propose_draft_token_ids(sampler_output.sampled_token_ids)
+                    propose_draft_token_ids_timed(sampler_output.sampled_token_ids)
                 if self.speculative_config and not use_padded_batch:
                     # ngram and other speculative decoding methods use the sampled
                     # tokens on the CPU, so they are run after bookkeeping.
-                    propose_draft_token_ids(valid_sampled_token_ids)
+                    propose_draft_token_ids_timed(valid_sampled_token_ids)
 
             # vLLM v0.18 defers KV connector finalization during target-model
             # forward when speculative decoding is enabled. Finalize here after
@@ -2947,7 +2986,10 @@ class NPUModelRunner(GPUModelRunner):
                 torch.npu.stream(global_stream()),
             ):
                 global_stream().wait_event(self.sampling_done_event)
+                update_started = time.monotonic()
                 self._update_states_after_model_execute(sampler_output.sampled_token_ids, scheduler_output)
+                if meter is not None:
+                    meter.note_sample_part("async_state_update", time.monotonic() - update_started)
 
         if not self.use_async_scheduling:
             return model_runner_output

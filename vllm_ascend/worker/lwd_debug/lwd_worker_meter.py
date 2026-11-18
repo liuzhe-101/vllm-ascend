@@ -16,6 +16,16 @@ _CLOUD_METRICS = (
     "up_harvest",
     "up_other",
     "native_prepare",
+    "accepted_event_wait",
+    "valid_count_event_wait",
+    "input_ids_prepare",
+    "inputs_embeds_h2d",
+    "spec_metadata",
+    "native_prepare_other",
+    "update_states",
+    "attention_metadata",
+    "logits",
+    "up_broadcast",
     "inject",
     "hash_engram_prepare",
     "prepare_other",
@@ -23,9 +33,17 @@ _CLOUD_METRICS = (
     "execute_other",
     "sample",
     "native_sample",
+    "sample_kernel",
+    "draft_propose",
+    "bookkeeping",
+    "async_state_update",
+    "native_sample_other",
     "collect",
     "send",
     "stage",
+    "stage_copy",
+    "stage_sync",
+    "stage_verify",
 )
 _EDGE_METRICS = (
     "embed_forward",
@@ -72,6 +90,9 @@ class LwdWorkerMeter:
         self._execute_prepare_total = 0.0
         self._execute_forward = 0.0
         self._prepare_up_stage = 0.0
+        self._prepare_native_total = 0.0
+        self._prepare_details: dict[str, float] = {}
+        self._sample_details: dict[str, float] = {}
         self._reset()
 
     def _reset(self) -> None:
@@ -95,6 +116,11 @@ class LwdWorkerMeter:
         self._execute_prepare_total = 0.0
         self._execute_forward = 0.0
         self._prepare_up_stage = 0.0
+        self._prepare_native_total = 0.0
+        self._prepare_details = {}
+
+    def begin_sample(self) -> None:
+        self._sample_details = {}
 
     def note_execute(self, seconds: float) -> None:
         execute_other = _residual(seconds, self._execute_prepare_total, self._execute_forward)
@@ -121,24 +147,53 @@ class LwdWorkerMeter:
         )
         self._prepare_up_stage = 0.0
         self._execute_prepare_total += prepare_total
+        native_other = _residual(
+            native_prepare,
+            self._prepare_native_total,
+            self._prepare_details.get("input_ids_prepare", 0.0),
+            self._prepare_details.get("spec_metadata", 0.0),
+        )
+        details = tuple(self._prepare_details.items()) + (("native_prepare_other", native_other),)
+        self._prepare_native_total = 0.0
+        self._prepare_details = {}
         self._note_many(
             (
                 ("prepare_total", prepare_total),
                 ("up_harvest", up_harvest),
                 ("up_other", up_other),
                 ("native_prepare", native_prepare),
+                *details,
                 ("inject", inject),
                 ("hash_engram_prepare", hash_engram_prepare),
                 ("prepare_other", prepare_other),
             )
         )
 
+    def note_prepare_detail(self, name: str, seconds: float) -> None:
+        self._prepare_details[name] = self._prepare_details.get(name, 0.0) + seconds
+        if name in {"accepted_event_wait", "valid_count_event_wait"}:
+            self._prepare_native_total += seconds
+        self._note(name, seconds)
+
     def note_forward(self, seconds: float) -> None:
         self._execute_forward += seconds
         self._note("forward", seconds)
 
     def note_native_sample(self, seconds: float) -> None:
-        self._note("native_sample", seconds)
+        other = _residual(seconds, *self._sample_details.values())
+        details = tuple(self._sample_details.items()) + (("native_sample_other", other),)
+        self._sample_details = {}
+        self._note_many((("native_sample", seconds), *details))
+
+    def note_sample_part(self, name: str, seconds: float) -> None:
+        self._sample_details[name] = self._sample_details.get(name, 0.0) + seconds
+        self._note(name, seconds)
+
+    def note_execution_part(self, name: str, seconds: float) -> None:
+        self._note(name, seconds)
+
+    def note_stage_part(self, name: str, seconds: float) -> None:
+        self._note(name, seconds)
 
     def note_sample(self, sample: float, send: float) -> None:
         self._note_many((("sample", sample), ("send", send)))
