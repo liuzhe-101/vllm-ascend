@@ -29,6 +29,16 @@ SPEC = importlib.util.spec_from_file_location("routing", ROOT / "worker/lwd_hash
 routing = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(routing)
 
+# The payload layout imports by package path; register the already-loaded
+# routing module under it so the plugin __init__ stays out of this file.
+sys.modules.setdefault("vllm_ascend.worker.lwd_hash.lwd_hash_routing", routing)
+_LAYOUT_SPEC = importlib.util.spec_from_file_location(
+    "lwd_up_payload", ROOT / "worker/lwd_hash/lwd_up_payload.py"
+)
+up_payload = importlib.util.module_from_spec(_LAYOUT_SPEC)
+sys.modules["lwd_up_payload"] = up_payload
+_LAYOUT_SPEC.loader.exec_module(up_payload)
+
 
 def load_methods(path, names, base=object, extra_classes=(), **globals_):
     """Compile real methods with a stub base to isolate hardware dependencies."""
@@ -51,14 +61,16 @@ RUNNER = "worker/lwd_cloud_model/lwd_cloud_model_runner.py"
 
 class TestHashTransport(unittest.TestCase):
     def test_lossless_ids_above_bf16_integer_precision(self):
+        layout = up_payload.LwdUpPayloadLayout(hidden_size=4, num_hash_layers=1, hash_top_k=2)
         embeds = torch.arange(12).reshape(3, 4).to(torch.bfloat16)
         ids = torch.tensor([0, 257, 511, 1023, 4095, 65535]).reshape(3, 1, 2)
-        payload = routing.pack_hash_payload(embeds, ids)
-        actual_embeds, actual_ids = routing.unpack_hash_payload(payload, 3, 4, 1, 2)
+        payload = layout.pack(embeds, expert_ids=ids)
+        actual_embeds, actual_ids, engram = layout.unpack(payload, 3)
         self.assertTrue(torch.equal(actual_embeds, embeds))
         self.assertTrue(torch.equal(actual_ids, ids))
+        self.assertIsNone(engram)
         with self.assertRaises(ValueError):
-            routing.unpack_hash_payload(payload[:-1], 3, 4, 1, 2)
+            layout.unpack(payload[:-1], 3)
 
     def test_reordered_mixed_requests_and_chunk_offsets(self):
         state = routing.LwdHashRoutingState(1, 2, 1024)
