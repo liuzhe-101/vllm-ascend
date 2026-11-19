@@ -577,6 +577,11 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         **model_kwargs,
     ) -> torch.Tensor:
         """Publish the full Hash routing data into the forward context."""
+        lwd_logger.info(
+            "[Lwd][perf] fwd-begin rank=%s ts=%.3f",
+            dist.get_rank(),
+            time.monotonic(),
+        )
         context = get_forward_context()
         if self.lwd_hash_state is not None:
             # Initialize the routing index cache first so padded rows use the legal zero index.
@@ -602,7 +607,7 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
                 # request-side placeholder: all zeros, never read (the
                 # router swaps in row indices).
                 input_ids = self._lwd_hash_placeholder_ids[:num_tokens_padded]
-        return super()._model_forward(
+        hidden_states = super()._model_forward(
             num_tokens_padded,
             input_ids,
             positions,
@@ -610,6 +615,12 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
             inputs_embeds,
             **model_kwargs,
         )
+        lwd_logger.info(
+            "[Lwd][perf] fwd-done rank=%s ts=%.3f",
+            dist.get_rank(),
+            time.monotonic(),
+        )
+        return hidden_states
 
     def _lwd_hash_dims(self) -> tuple[int, int]:
         """(num_hash_layers, experts_per_tok), cached at first use."""
