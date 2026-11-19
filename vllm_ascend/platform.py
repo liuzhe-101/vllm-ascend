@@ -1610,6 +1610,10 @@ def _get_dyntra_lb_scheduler_cls(*, async_scheduling: bool) -> str:
 
 
 def _validate_engram_config(vllm_config: VllmConfig) -> None:
+    lwd_config = getattr(vllm_config, "lwd_config", None)
+    if lwd_config is not None and lwd_config.role == "edge":
+        # Layer ids remain hash metadata on the edge; only the cloud owns tables.
+        return
     engram_config = getattr(vllm_config, "engram_config", None)
     model_config = vllm_config.model_config
     spec = vllm_config.speculative_config
