@@ -202,6 +202,18 @@ class LwdCloudWorker(LwdWorkerBase):
             "[Lwd][perf] cloud-exec total=%.2fms",
             (time.monotonic() - _t0) * 1000,
         )
+        # Probe: the FULL-graph forward is an async NPU replay, so the
+        # host-side ``cloud-exec total`` above undercounts the device-side
+        # work. Drain the current stream to measure the real per-rank device
+        # forward duration (ranks 2-8 will show collective-wait if rank 1 is
+        # the straggler, or stay fast if the slowness is rank-1-local).
+        _d0 = time.monotonic()
+        torch.npu.current_stream().synchronize()
+        lwd_logger.info(
+            "[Lwd][perf] cloud-device-drain rank=%d ms=%.2f",
+            self.rank,
+            (time.monotonic() - _d0) * 1000,
+        )
         return output
 
     def _lwd_up_post_recvs(self, scheduler_output: SchedulerOutput) -> None:
