@@ -13,6 +13,7 @@ runner class at init_device when ``lwd_config`` is set.
 
 from __future__ import annotations
 
+import os
 import time
 from typing import TYPE_CHECKING, NamedTuple
 
@@ -704,6 +705,8 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         tail_per_row = 4 * num_hash_layers * top_k
         windows: list[LwdUpWindow] = []
         tp = get_tp_group()
+        if tp.world_size > 1 and os.environ.get("VLLM_LWD_PROBE_BROADCAST_PLAN"):
+            self._lwd_probe_broadcast_plan(grouped, worker, hidden_size, tail_per_row, tp)
         for connection in sorted(grouped):
             connection_plan = grouped[connection]
             numel = sum(window.rows for window in connection_plan) * (hidden_size + tail_per_row)
@@ -727,6 +730,51 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
                 work.wait()
             windows.append(LwdUpWindow(connection, dev, win_idx, connection_plan))
         return windows
+
+    def _lwd_probe_broadcast_plan(
+        self,
+        grouped,
+        worker,
+        hidden_size: int,
+        tail_per_row: int,
+        tp,
+    ) -> None:
+        """Fail fast on TP-rank divergence in the UP broadcast plan.
+
+        ``_lwd_harvest_up_batches`` issues one ``dist.broadcast`` per
+        connection. If ranks derive a different connection set, tensor
+        numel, or source rank from scheduler state (e.g. async spec-decode
+        optimism skew), the HCCL broadcasts silently mismatch and the
+        forward pass deadlocks instead of erroring. Gather a deterministic
+        fingerprint before the loop and raise on the first disagreement.
+        """
+        fingerprint = [
+            (
+                (int(connection.edge_id), int(connection.cloud_id), int(connection.dp_idx)),
+                int(sum(window.rows for window in windows) * (hidden_size + tail_per_row)),
+                int(worker._lwd_up_src_ranks[connection]),
+                tuple(
+                    (window.req_id, int(window.start), int(window.rows))
+                    for window in windows
+                ),
+            )
+            for connection, windows in sorted(grouped.items())
+        ]
+        gathered = [None] * tp.world_size
+        # Object exchange rides the CPU/gloo group: reliable on Ascend and
+        # immune to the HCCL broadcast we are trying to diagnose.
+        dist.all_gather_object(gathered, fingerprint, group=tp.cpu_group)
+        if any(entry != fingerprint for entry in gathered):
+            lwd_logger.error(
+                "[LWD][probe] broadcast plan DIVERGED rank=%s local=%s gathered=%s",
+                dist.get_rank(),
+                fingerprint,
+                gathered,
+            )
+            raise RuntimeError(
+                f"[LWD][probe] TP broadcast plan diverged on rank "
+                f"{dist.get_rank()}: local={fingerprint} gathered={gathered}"
+            )
 
     def _lwd_request_connection(self, req_id: str) -> ConnectionId:
         """Resolve one request's UP/DOWN connection without a default route.
