@@ -705,12 +705,32 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         tail_per_row = 4 * num_hash_layers * top_k
         windows: list[LwdUpWindow] = []
         tp = get_tp_group()
-        if tp.world_size > 1 and os.environ.get("VLLM_LWD_PROBE_BROADCAST_PLAN"):
+        debug = bool(os.environ.get("VLLM_LWD_PROBE_BROADCAST_PLAN"))
+        if debug:
+            lwd_logger.info(
+                "[LWD][harvest] debug active rank=%s tp_ws=%s conns=%s rows=%d",
+                dist.get_rank(),
+                tp.world_size,
+                sorted((int(c.edge_id), int(c.cloud_id), int(c.dp_idx)) for c in grouped),
+                sum(window.rows for window in plan),
+            )
+        if tp.world_size > 1 and debug:
             self._lwd_probe_broadcast_plan(grouped, worker, hidden_size, tail_per_row, tp)
         for connection in sorted(grouped):
             connection_plan = grouped[connection]
             numel = sum(window.rows for window in connection_plan) * (hidden_size + tail_per_row)
             connection_endpoint = worker._lwd_up_src_ranks[connection] == dist.get_rank()
+            if debug:
+                lwd_logger.info(
+                    "[LWD][harvest] ITER-begin rank=%s conn=(%s,%s,%s) endpoint=%s numel=%d rows=%d",
+                    dist.get_rank(),
+                    connection.edge_id,
+                    connection.cloud_id,
+                    connection.dp_idx,
+                    connection_endpoint,
+                    numel,
+                    sum(window.rows for window in connection_plan),
+                )
             if connection_endpoint:
                 stager = worker._lwd_stager
                 if stager is None:
@@ -720,6 +740,15 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
             else:
                 dev = torch.empty(numel, dtype=torch.bfloat16, device=self.device)
                 win_idx = None
+            if debug:
+                lwd_logger.info(
+                    "[LWD][harvest] BCAST-begin rank=%s conn=(%s,%s,%s) src=%s",
+                    dist.get_rank(),
+                    connection.edge_id,
+                    connection.cloud_id,
+                    connection.dp_idx,
+                    worker._lwd_up_src_ranks[connection],
+                )
             if tp.world_size > 1:
                 work = dist.broadcast(
                     dev,
@@ -728,7 +757,17 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
                     async_op=True,
                 )
                 work.wait()
+            if debug:
+                lwd_logger.info(
+                    "[LWD][harvest] BCAST-done rank=%s conn=(%s,%s,%s)",
+                    dist.get_rank(),
+                    connection.edge_id,
+                    connection.cloud_id,
+                    connection.dp_idx,
+                )
             windows.append(LwdUpWindow(connection, dev, win_idx, connection_plan))
+        if debug:
+            lwd_logger.info("[LWD][harvest] HARVEST-done rank=%s windows=%d", dist.get_rank(), len(windows))
         return windows
 
     def _lwd_probe_broadcast_plan(
