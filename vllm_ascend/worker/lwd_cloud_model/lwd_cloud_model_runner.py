@@ -622,6 +622,33 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         )
         return hidden_states
 
+    def _update_full_graph_params_if_needed(
+        self,
+        forward_context,
+        num_tokens_padded,
+    ) -> None:
+        """Bracket the post-forward graph-params update to split the hang.
+
+        ``run-done`` fires right after ``run_model()`` returns (host-side
+        graph-replay launch), before the parent's device synchronize;
+        ``update-done`` fires after that synchronize. The gap between the
+        two isolates the device-side forward vs. the host-side launch.
+        """
+        lwd_logger.info(
+            "[Lwd][perf] run-done rank=%s ts=%.3f",
+            dist.get_rank(),
+            time.monotonic(),
+        )
+        super()._update_full_graph_params_if_needed(
+            forward_context,
+            num_tokens_padded,
+        )
+        lwd_logger.info(
+            "[Lwd][perf] update-done rank=%s ts=%.3f",
+            dist.get_rank(),
+            time.monotonic(),
+        )
+
     def _lwd_hash_dims(self) -> tuple[int, int]:
         """(num_hash_layers, experts_per_tok), cached at first use."""
         dims = self._lwd_hash_dims_cached
