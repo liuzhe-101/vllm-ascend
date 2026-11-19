@@ -72,6 +72,30 @@ class TestHashTransport(unittest.TestCase):
         with self.assertRaises(ValueError):
             layout.unpack(payload[:-1], 3)
 
+    def test_engram_segment_rides_beside_the_expert_ids(self):
+        """Both tails present: each is carved by its own per-row size."""
+        layout = up_payload.LwdUpPayloadLayout(
+            hidden_size=4, num_hash_layers=1, hash_top_k=2, num_engram_layers=2, num_engram_cols=3
+        )
+        embeds = torch.arange(8).reshape(2, 4).to(torch.bfloat16)
+        ids = torch.tensor([[[1, 2]], [[3, 4]]], dtype=torch.int32)
+        hashes = torch.arange(12).reshape(2, 2, 3).to(torch.int32)
+        payload = layout.pack(embeds, expert_ids=ids, engram_hashes=hashes)
+        self.assertEqual(payload.numel(), layout.numel(2))
+        actual_embeds, actual_ids, actual_hashes = layout.unpack(payload, 2)
+        self.assertTrue(torch.equal(actual_embeds, embeds))
+        self.assertTrue(torch.equal(actual_ids, ids))
+        self.assertTrue(torch.equal(actual_hashes, hashes))
+
+    def test_a_segment_the_layout_does_not_have_is_rejected(self):
+        """Mismatched layouts must fail here, not address wrong rows later."""
+        layout = up_payload.LwdUpPayloadLayout(hidden_size=4)
+        embeds = torch.arange(8).reshape(2, 4).to(torch.bfloat16)
+        with self.assertRaises(ValueError):
+            layout.pack(embeds, expert_ids=torch.ones(2, 1, 2, dtype=torch.int32))
+        with self.assertRaises(ValueError):
+            up_payload.LwdUpPayloadLayout(hidden_size=4, num_hash_layers=1)
+
     def test_reordered_mixed_requests_and_chunk_offsets(self):
         state = routing.LwdHashRoutingState(1, 2, 1024)
         a = torch.tensor([[[257, 511]], [[7, 8]]])
