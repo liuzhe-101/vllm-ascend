@@ -179,14 +179,6 @@ class LwdCloudWorker(LwdWorkerBase):
     # ------------------------------------------------------------------ #
 
     def execute_model(self, scheduler_output: SchedulerOutput) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
-        # [Lwd][perf] Worker start time (subtract the engine's rpc-enqueue
-        # ts = dispatch-to-start latency; spread across ranks = collective
-        # alignment cost)
-        lwd_logger.info(
-            "[Lwd][perf] worker-exec-start rank=%d ts=%.3f",
-            self.rank,
-            time.monotonic(),
-        )
         self._lwd_up_post_recvs(scheduler_output)
 
         # finished_req_ids releases runner and host-stage request state.
@@ -194,16 +186,7 @@ class LwdCloudWorker(LwdWorkerBase):
             self._lwd_cloud_flush_finished(scheduler_output.finished_req_ids)
 
         lwd_get_data_plane().poll_completions()  # lazy keepalive reap
-        _t0 = time.monotonic()
-        output = super().execute_model(scheduler_output)
-        # [Lwd][perf] Per-step exec_model timing on the cloud: total = the
-        # whole forward pass (sample/collect are itemized separately in
-        # sample_tokens)
-        lwd_logger.info(
-            "[Lwd][perf] cloud-exec total=%.2fms",
-            (time.monotonic() - _t0) * 1000,
-        )
-        return output
+        return super().execute_model(scheduler_output)
 
     def _lwd_up_post_recvs(self, scheduler_output: SchedulerOutput) -> None:
         """Apply abort notices carried by normal or abort-only scheduler batches."""
