@@ -265,6 +265,11 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
             out = super()._prepare_inputs(scheduler_output, num_scheduled_tokens)
         finally:
             self.input_batch.req_prompt_embeds = embeds_map
+        lwd_logger.info(
+            "[Lwd][perf] prepare-native-done rank=%s ts=%.3f",
+            dist.get_rank(),
+            time.monotonic(),
+        )
         self._lwd_rebuild_is_token_ids_mask(num_scheduled_tokens)
         self._lwd_release_consumed_prompt_embeds()
         for window in windows:
@@ -276,6 +281,11 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
             )
         if self.lwd_hash_state is not None:
             self._lwd_prepare_hash_batch(num_scheduled_tokens)
+        lwd_logger.info(
+            "[Lwd][perf] prepare-done rank=%s ts=%.3f",
+            dist.get_rank(),
+            time.monotonic(),
+        )
         return out
 
     def _lwd_prepare_hash_batch(self, num_scheduled_tokens: np.ndarray) -> None:
