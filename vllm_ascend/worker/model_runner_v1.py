@@ -53,6 +53,7 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.forward_context import BatchDescriptor, ForwardContext, get_forward_context
 from vllm.logger import logger
+from vllm.lwd_logger import lwd_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.model_loader import get_model
@@ -2407,6 +2408,11 @@ class NPUModelRunner(GPUModelRunner):
                     num_reqs_padded,
                     self.parallel_config.num_ubatches,
                 )
+                lwd_logger.info(
+                    "[Lwd][perf] native-prep-a rank=%s ts=%.3f",
+                    dist.get_rank(),
+                    time.monotonic(),
+                )
 
                 if self.dynamic_eplb:
                     self.update_eplb_heat_collection_status(num_tokens_padded, num_tokens_across_dp)
@@ -2526,6 +2532,11 @@ class NPUModelRunner(GPUModelRunner):
 
             # update global cos, sin
             update_cos_sin(positions)
+            lwd_logger.info(
+                "[Lwd][perf] native-prep-b rank=%s ts=%.3f",
+                dist.get_rank(),
+                time.monotonic(),
+            )
 
         if self.kvpp.scheduler is not None:
             self.kvpp.prepare_forward(bool(np.any(self.input_batch.num_computed_tokens_cpu[:num_reqs] > 0)))
@@ -2592,6 +2603,11 @@ class NPUModelRunner(GPUModelRunner):
                 if mamba_copy_connector is None:
                     mamba_utils.do_mamba_copy_block(preprocess_bufs)
             self._restore_c8_mxfp_loaded_v_scales(scheduler_output)
+            lwd_logger.info(
+                "[Lwd][perf] native-prep-c rank=%s ts=%.3f",
+                dist.get_rank(),
+                time.monotonic(),
+            )
             hidden_states = self._model_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
             )
