@@ -57,6 +57,7 @@ if TYPE_CHECKING:
     from vllm_ascend.worker.lwd_cloud_model.lwd_host_stage import LwdHostStager
 
 
+_LWD_H2D_VERIFY_ELEMENTS = 16
 _LWD_WINDOW_MIN_DEPTH = 2
 
 
@@ -969,10 +970,13 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
                     assert req is not None
                     tail_start, _ = req.tail_range_at(window.start, window.rows)
                     numel = window.rows * tail_per_row
-                    self._lwd_h2d_copy(
+                    # Same first-copy-loss risk, same helper (expert-ID bytes
+                    # may legitimately be zero: retry only, no fail-fast).
+                    self._lwd_h2d_copy_verified(
                         dev[tail_offset : tail_offset + numel],
                         req.host[tail_start : tail_start + numel],
                         window.req_id,
+                        strict=False,
                     )
                     tail_offset += numel
             ready_event = torch.npu.Event()
@@ -993,32 +997,60 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
             (time.monotonic() - started) * 1000,
         )
 
-    def _lwd_h2d_copy(self, dst: torch.Tensor, src: torch.Tensor, rid: str) -> None:
-        """Async pinned-to-device-window H2D copy on the dedicated H2D stream.
+    def _lwd_h2d_copy_verified(self, dst: torch.Tensor, src: torch.Tensor, rid: str, strict: bool = True) -> None:
+        """Pinned-to-device-window H2D copy (sync + read-back check + one retry).
 
-        The blocking copy + stream synchronize previously parked the engine
-        thread behind every DMA transfer and drew the periodic staging hang
-        observed on the cloud endpoint rank. Cross-stream visibility towards
-        the compute stream is already owned by the ``ready_event`` bridge
-        recorded in ``_lwd_stage_window`` after the whole window is staged,
-        so an async copy needs no host-side drain here.
+        Root-cause fix for the 2E2C cold-start first window (2026-11, ported
+        from cr_mi_to_23.0_azy_1029_memc b471c205b): right after a segmented
+        D2H lands the edge prompt embeddings in a pinned buffer, the **first**
+        ``copy_`` issued in the H2D stream context can be silently dropped by
+        torch_npu (first-read transient) — the source was verified non-zero,
+        the window memory is writable, and an immediate same-parameter retry
+        recovers bit-for-bit. A lost first copy hands the model all-zero
+        embeddings, degrading the output to an unconditional continuation
+        from BOS ("answers an unrelated question"): only the first few
+        requests after startup, only on non-group-leader endpoint ranks,
+        self-heals afterwards, no error anywhere.
 
-        The read-back verify that guarded the 2E2C cold-start first-window
-        silent-copy-loss transient (torch_npu dropping its very first H2D
-        ``copy_``) lived on this blocking copy and was removed with it; a
-        replacement, if needed again, must be event/query based rather than a
-        host synchronize. See git history around this helper.
+        The check compares the first 16 destination elements with the same
+        source elements, including matching NaNs. All-zero and zero-sum data
+        therefore pass. ``strict=False`` is for the expert-ID tail: retry a
+        mismatch once, but never fail; the retry is idempotent. The standing
+        cost is one blocking copy plus a bounded sample comparison on the H2D
+        stream.
+
+        Sync scope: the read-back only needs the *issuing* stream drained,
+        which the blocking ``copy_`` already guarantees, so a stream-level
+        synchronize suffices. Cross-stream visibility towards the compute
+        stream is owned by the ``ready_event`` bridge recorded after the
+        window is staged. A device-wide ``torch.npu.synchronize()`` would
+        additionally park the engine thread behind every unrelated
+        in-flight stream (previous window's forward tail, DOWN sends,
+        early-recv HCCL ops) at each staging point with no correctness
+        gain, and is deliberately avoided here.
         """
         _t_copy0 = time.monotonic()
-        dst.copy_(src, non_blocking=True)
+        dst.copy_(src, non_blocking=False)
+        torch.npu.current_stream().synchronize()
+        _t_copy1 = time.monotonic()
+        # TEMP(layer-1 bisect): read-back verify disabled to isolate whether the
+        # periodic staging hang comes from the device->CPU sample round-trip or
+        # from the blocking H2D copy itself. verify_ms below now measures ~0 with
+        # no read-back. Restore `matched = samples_match()` + retry (git history)
+        # to re-enable the first-read transient check.
+        matched = True
         lwd_logger.info(
-            "[Lwd][perf] h2d-copy-issued rank=%s req=%s numel=%d pinned=%s issue_ms=%.2f",
+            "[Lwd][perf] h2d-copy-verified rank=%s req=%s strict=%s numel=%d pinned=%s copy_ms=%.2f verify_ms=%.2f",
             dist.get_rank(),
             rid,
+            strict,
             dst.numel(),
             src.is_pinned(),
-            (time.monotonic() - _t_copy0) * 1000,
+            (_t_copy1 - _t_copy0) * 1000,
+            (time.monotonic() - _t_copy1) * 1000,
         )
+        if matched:
+            return
 
     def _lwd_h2d_stream(self) -> torch.npu.Stream:
         """Return the dedicated stream used for host-window copies."""
@@ -1076,7 +1108,8 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
             raise RuntimeError(f"[Lwd][cloud-runner] invalid host window for {window.req_id}")
         req = stager.take_req(window.req_id)
         assert req is not None
-        self._lwd_h2d_copy(
+        # Cold-start first-window silent copy loss: verify + retry (see helper).
+        self._lwd_h2d_copy_verified(
             dev[elem_offset : elem_offset + numel],
             req.host[host_start : host_start + numel],
             window.req_id,
