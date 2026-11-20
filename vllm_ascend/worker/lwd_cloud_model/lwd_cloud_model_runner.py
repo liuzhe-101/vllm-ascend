@@ -923,8 +923,14 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         stream = self._lwd_h2d_stream()
         used_event = self._lwd_win_used_ev[win_idx]
         with torch.npu.stream(stream):
+            _t_we = time.monotonic()
             if used_event is not None:
                 stream.wait_event(used_event)
+            lwd_logger.info(
+                "[Lwd][perf] stage-wait-used rank=%s ms=%.2f",
+                dist.get_rank(),
+                (time.monotonic() - _t_we) * 1000,
+            )
             embed_offset = 0
             tail_offset = embed_numel
             for window in plan:
@@ -946,7 +952,13 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
                     tail_offset += numel
             ready_event = torch.npu.Event()
             ready_event.record(stream)
+        _t_rw = time.monotonic()
         torch.npu.current_stream().wait_event(ready_event)
+        lwd_logger.info(
+            "[Lwd][perf] stage-ready-wait rank=%s ms=%.2f",
+            dist.get_rank(),
+            (time.monotonic() - _t_rw) * 1000,
+        )
         for window in plan:
             stager.consume(window.req_id, window.rows)
         lwd_logger.info(
@@ -988,8 +1000,10 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         early-recv HCCL ops) at each staging point with no correctness
         gain, and is deliberately avoided here.
         """
+        _t_copy0 = time.monotonic()
         dst.copy_(src, non_blocking=False)
         torch.npu.current_stream().synchronize()
+        _t_copy1 = time.monotonic()
         dst_sample = dst[:_LWD_H2D_VERIFY_ELEMENTS]
         src_sample = src[:_LWD_H2D_VERIFY_ELEMENTS]
 
@@ -1008,7 +1022,17 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
                 return bool(torch.all((dst_cpu == src_cpu) | (torch.isnan(dst_cpu) & torch.isnan(src_cpu))).item())
             return False
 
-        if samples_match():
+        matched = samples_match()
+        lwd_logger.info(
+            "[Lwd][perf] h2d-copy-verified rank=%s req=%s strict=%s numel=%d copy_ms=%.2f verify_ms=%.2f",
+            dist.get_rank(),
+            rid,
+            strict,
+            dst.numel(),
+            (_t_copy1 - _t_copy0) * 1000,
+            (time.monotonic() - _t_copy1) * 1000,
+        )
+        if matched:
             return
         lwd_logger.warning(
             "[LWD][cloud-runner] H2D first-copy mismatch req=%s (sample differs after sync copy; retrying)",
