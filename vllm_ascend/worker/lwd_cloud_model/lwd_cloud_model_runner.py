@@ -1040,11 +1040,12 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         # to re-enable the first-read transient check.
         matched = True
         lwd_logger.info(
-            "[Lwd][perf] h2d-copy-verified rank=%s req=%s strict=%s numel=%d copy_ms=%.2f verify_ms=%.2f",
+            "[Lwd][perf] h2d-copy-verified rank=%s req=%s strict=%s numel=%d pinned=%s copy_ms=%.2f verify_ms=%.2f",
             dist.get_rank(),
             rid,
             strict,
             dst.numel(),
+            src.is_pinned(),
             (_t_copy1 - _t_copy0) * 1000,
             (time.monotonic() - _t_copy1) * 1000,
         )
