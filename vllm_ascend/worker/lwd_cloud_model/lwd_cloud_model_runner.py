@@ -926,6 +926,13 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
             dist.get_rank(),
             (time.monotonic() - _t_pcd) * 1000,
         )
+        _t_pdd = time.monotonic()
+        torch.npu.synchronize()
+        lwd_logger.info(
+            "[Lwd][perf] stage-pre-device-drain rank=%s ms=%.2f",
+            dist.get_rank(),
+            (time.monotonic() - _t_pdd) * 1000,
+        )
         embed_numel = sum(window.rows for window in plan) * hidden_size
         stream = self._lwd_h2d_stream()
         used_event = self._lwd_win_used_ev[win_idx]
