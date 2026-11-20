@@ -25,7 +25,8 @@ from vllm.lwd_logger import lwd_logger
 from vllm.v1.lwd_control.lwd_comm.lwd_id_adapter import parse_edge_id
 from vllm.v1.outputs import ModelRunnerOutput
 
-from vllm_ascend.distributed.lwd_data_plane.lwd_types import ConnectionId
+from vllm_ascend.distributed.lwd_data_plane.lwd_channels import lwd_get_channel_stream
+from vllm_ascend.distributed.lwd_data_plane.lwd_types import ConnectionId, LwdChannelType
 from vllm_ascend.worker.lwd_base_model.lwd_base_model_runner import LwdBaseModelRunner
 from vllm_ascend.worker.lwd_cloud_model.lwd_mtp_proposer import LwdMTPProposer
 from vllm_ascend.worker.lwd_cloud_model.lwd_token_rank import LwdTokenRankEncoder
@@ -786,7 +787,7 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
                     raise RuntimeError("[Lwd][cloud-runner] endpoint rank without host stager")
                 dev, win_idx = self._lwd_window_device(numel, min_depth=len(grouped))
                 _l0 = time.monotonic()
-                self._lwd_stage_window(stager, connection_plan, dev, win_idx, hidden_size, tail_per_row)
+                self._lwd_stage_window(stager, connection_plan, dev, win_idx, hidden_size, tail_per_row, connection)
                 lwd_logger.info(
                     "[Lwd][perf] harvest-stage rank=%s ms=%.2f",
                     dist.get_rank(),
@@ -916,6 +917,7 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         win_idx: int,
         hidden_size: int,
         tail_per_row: int,
+        connection: ConnectionId,
     ) -> None:
         """Reassemble host embeddings and expert tails on the dedicated H2D stream."""
         started = time.monotonic()
@@ -925,6 +927,19 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
             "[Lwd][perf] stage-pre-compute-drain rank=%s ms=%.2f",
             dist.get_rank(),
             (time.monotonic() - _t_pcd) * 1000,
+        )
+        _t_pddn = time.monotonic()
+        down_stream = lwd_get_channel_stream(
+            LwdChannelType.DOWN,
+            connection.dp_idx,
+            edge_id=connection.edge_id,
+            cloud_id=connection.cloud_id,
+        )
+        down_stream.synchronize()
+        lwd_logger.info(
+            "[Lwd][perf] stage-pre-down-drain rank=%s ms=%.2f",
+            dist.get_rank(),
+            (time.monotonic() - _t_pddn) * 1000,
         )
         _t_pdd = time.monotonic()
         torch.npu.synchronize()
