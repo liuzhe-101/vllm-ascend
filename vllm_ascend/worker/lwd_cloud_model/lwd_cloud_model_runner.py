@@ -1033,12 +1033,25 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         dst.copy_(src, non_blocking=False)
         torch.npu.current_stream().synchronize()
         _t_copy1 = time.monotonic()
-        # TEMP(layer-1 bisect): read-back verify disabled to isolate whether the
-        # periodic staging hang comes from the device->CPU sample round-trip or
-        # from the blocking H2D copy itself. verify_ms below now measures ~0 with
-        # no read-back. Restore `matched = samples_match()` + retry (git history)
-        # to re-enable the first-read transient check.
-        matched = True
+        dst_sample = dst[:_LWD_H2D_VERIFY_ELEMENTS]
+        src_sample = src[:_LWD_H2D_VERIFY_ELEMENTS]
+
+        def samples_match() -> bool:
+            try:
+                if torch.equal(dst_sample, src_sample):
+                    return True
+            except RuntimeError:
+                # Some backends require both operands on the same device.
+                pass
+            dst_cpu = dst_sample.cpu()
+            src_cpu = src_sample.cpu()
+            if torch.equal(dst_cpu, src_cpu):
+                return True
+            if dst_cpu.is_floating_point() or dst_cpu.is_complex():
+                return bool(torch.all((dst_cpu == src_cpu) | (torch.isnan(dst_cpu) & torch.isnan(src_cpu))).item())
+            return False
+
+        matched = samples_match()
         lwd_logger.info(
             "[Lwd][perf] h2d-copy-verified rank=%s req=%s strict=%s numel=%d pinned=%s copy_ms=%.2f verify_ms=%.2f",
             dist.get_rank(),
@@ -1051,6 +1064,17 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         )
         if matched:
             return
+        lwd_logger.warning(
+            "[LWD][cloud-runner] H2D first-copy mismatch req=%s (sample differs after sync copy; retrying)",
+            rid,
+        )
+        dst.copy_(src, non_blocking=False)
+        torch.npu.current_stream().synchronize()
+        if strict and not samples_match():
+            raise RuntimeError(
+                f"[LWD][cloud-runner] H2D copy mismatch twice req={rid} "
+                "(source and destination samples differ after retry)"
+            )
 
     def _lwd_h2d_stream(self) -> torch.npu.Stream:
         """Return the dedicated stream used for host-window copies."""
