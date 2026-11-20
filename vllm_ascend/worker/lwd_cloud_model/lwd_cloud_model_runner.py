@@ -785,7 +785,13 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
                 if stager is None:
                     raise RuntimeError("[Lwd][cloud-runner] endpoint rank without host stager")
                 dev, win_idx = self._lwd_window_device(numel, min_depth=len(grouped))
+                _l0 = time.monotonic()
                 self._lwd_stage_window(stager, connection_plan, dev, win_idx, hidden_size, tail_per_row)
+                lwd_logger.info(
+                    "[Lwd][perf] harvest-stage rank=%s ms=%.2f",
+                    dist.get_rank(),
+                    (time.monotonic() - _l0) * 1000,
+                )
             else:
                 dev = torch.empty(numel, dtype=torch.bfloat16, device=self.device)
                 win_idx = None
@@ -798,6 +804,7 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
                 worker._lwd_up_src_ranks[connection],
             )
             if tp.world_size > 1:
+                _l1 = time.monotonic()
                 work = dist.broadcast(
                     dev,
                     src=worker._lwd_up_src_ranks[connection],
@@ -805,6 +812,11 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
                     async_op=True,
                 )
                 work.wait()
+                lwd_logger.info(
+                    "[Lwd][perf] harvest-bcast rank=%s ms=%.2f",
+                    dist.get_rank(),
+                    (time.monotonic() - _l1) * 1000,
+                )
             lwd_logger.info(
                 "[LWD][harvest] BCAST-done rank=%s conn=(%s,%s,%s)",
                 dist.get_rank(),
