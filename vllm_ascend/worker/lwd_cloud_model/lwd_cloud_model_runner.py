@@ -582,6 +582,18 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
             dist.get_rank(),
             time.monotonic(),
         )
+        # Probe: drain the current stream right after _prepare_inputs has
+        # enqueued its async device ops (HCCL broadcast / H2D event bridge /
+        # injection D2D) but before the FULL-graph replay barrier. If rank 1
+        # shows ~99s here, the slow op is inside _prepare_inputs; if fast, the
+        # slow op is elsewhere.
+        _d0 = time.monotonic()
+        torch.npu.current_stream().synchronize()
+        lwd_logger.info(
+            "[Lwd][perf] pre-fwd-drain rank=%s ms=%.2f",
+            dist.get_rank(),
+            (time.monotonic() - _d0) * 1000,
+        )
         context = get_forward_context()
         if self.lwd_hash_state is not None:
             # Initialize the routing index cache first so padded rows use the legal zero index.
