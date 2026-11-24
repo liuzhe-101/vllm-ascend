@@ -34,12 +34,7 @@ if TYPE_CHECKING:
     from vllm.distributed.device_communicators.shm_broadcast import Handle, MessageQueue
 
 _SIDEBAND_MAX_CHUNK_BYTES = 4096
-# 64 chunks wedged under prefix-cache bursts: one ~0.3s step observed 73
-# completions (one per announced chunk); the writer's unbounded acquire_write
-# spin then parked the comm thread with the GIL, hint backpressure froze the
-# engine, and the loop never reopened. 512 covers per-step announcements x
-# in-flight requests with headroom (~2 MiB shm per MQ at 4 KiB chunks).
-_SIDEBAND_MAX_CHUNKS = 512
+_SIDEBAND_MAX_CHUNKS = 64
 
 
 class LwdRecvHintFields(NamedTuple):
