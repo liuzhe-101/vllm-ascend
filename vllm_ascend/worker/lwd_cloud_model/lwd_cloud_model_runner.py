@@ -25,8 +25,7 @@ from vllm.lwd_logger import lwd_logger
 from vllm.v1.lwd_control.lwd_comm.lwd_id_adapter import parse_edge_id
 from vllm.v1.outputs import ModelRunnerOutput
 
-from vllm_ascend.distributed.lwd_data_plane.lwd_channels import lwd_get_channel_stream
-from vllm_ascend.distributed.lwd_data_plane.lwd_types import ConnectionId, LwdChannelType
+from vllm_ascend.distributed.lwd_data_plane.lwd_types import ConnectionId
 from vllm_ascend.worker.lwd_base_model.lwd_base_model_runner import LwdBaseModelRunner
 from vllm_ascend.worker.lwd_cloud_model.lwd_mtp_proposer import LwdMTPProposer
 from vllm_ascend.worker.lwd_cloud_model.lwd_token_rank import LwdTokenRankEncoder
@@ -921,33 +920,6 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
     ) -> None:
         """Reassemble host embeddings and expert tails on the dedicated H2D stream."""
         started = time.monotonic()
-        _t_pcd = time.monotonic()
-        torch.npu.current_stream().synchronize()
-        lwd_logger.info(
-            "[Lwd][perf] stage-pre-compute-drain rank=%s ms=%.2f",
-            dist.get_rank(),
-            (time.monotonic() - _t_pcd) * 1000,
-        )
-        _t_pddn = time.monotonic()
-        down_stream = lwd_get_channel_stream(
-            LwdChannelType.DOWN,
-            connection.dp_idx,
-            edge_id=connection.edge_id,
-            cloud_id=connection.cloud_id,
-        )
-        down_stream.synchronize()
-        lwd_logger.info(
-            "[Lwd][perf] stage-pre-down-drain rank=%s ms=%.2f",
-            dist.get_rank(),
-            (time.monotonic() - _t_pddn) * 1000,
-        )
-        _t_pdd = time.monotonic()
-        torch.npu.synchronize()
-        lwd_logger.info(
-            "[Lwd][perf] stage-pre-device-drain rank=%s ms=%.2f",
-            dist.get_rank(),
-            (time.monotonic() - _t_pdd) * 1000,
-        )
         embed_numel = sum(window.rows for window in plan) * hidden_size
         stream = self._lwd_h2d_stream()
         used_event = self._lwd_win_used_ev[win_idx]
