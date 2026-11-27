@@ -1371,7 +1371,15 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         lg_sel = logits if full_cover else logits[idx]
         sm_sel = sampled[:, 0] if full_cover else sampled[idx][:, 0]
         ranks = [self._lwd_token_rank_encoder.encode(lg_sel, sm_sel)]
-        hidden_packet = torch.cat([sample_hidden_states[i : i + 1] for i in idx])
+        if (
+            full_cover
+            and sample_hidden_states is not None
+            and sample_hidden_states.shape[0] == len(idx)
+            and sample_hidden_states.is_contiguous()
+        ):
+            hidden_packet = sample_hidden_states
+        else:
+            hidden_packet = torch.cat([sample_hidden_states[i : i + 1] for i in idx])
         return LwdDownSelection(
             hidden_packet=hidden_packet,
             ranks=ranks,
@@ -1424,8 +1432,25 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         if vidx_np.size == 0:
             return None
         vlen_np = rows_per_req[vidx_np].astype(np.int64)
-        starts_v = seg_starts[vidx_np].astype(np.int64)
         n_rows = int(vlen_np.sum())
+        n_valid = vidx_np.size
+        if n_valid == 1 and n_rows == total_rows:
+            # Single-request full coverage makes every row index an identity
+            # mapping; skip the index H2D and both sampled/hidden gathers.
+            req_idx = int(vidx_np[0])
+            sampled_rows = sampled[req_idx, :n_rows]
+            lg_rows = logits[:n_rows]
+            hidden_packet = sample_hidden_states[:n_rows]
+            ranks = [self._lwd_token_rank_encoder.encode(lg_rows, sampled_rows)]
+            counts_dev = counts_all[req_idx : req_idx + 1].clamp_max(n_rows).to(torch.int32)
+            return LwdDownSelection(
+                hidden_packet=hidden_packet,
+                ranks=ranks,
+                counts_dev=counts_dev,
+                seg_lens_host=[n_rows],
+            )
+
+        starts_v = seg_starts[vidx_np].astype(np.int64)
         req_idx_np = np.repeat(vidx_np, vlen_np)
         pos_idx_np = np.arange(n_rows, dtype=np.int64) - np.repeat(np.cumsum(vlen_np) - vlen_np, vlen_np)
         row_sel_np = np.repeat(starts_v, vlen_np) + pos_idx_np
@@ -1433,7 +1458,6 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         # synchronous H2D would stall the main stream waiting for the
         # device to drain — the same lesson as seg_lens)
         buf = self._lwd_h2d_stage_i64(np.concatenate([req_idx_np, pos_idx_np, row_sel_np, vidx_np, vlen_np]))
-        n_valid = vidx_np.size
         req_d, pos_d = buf[:n_rows], buf[n_rows : 2 * n_rows]
         sel_d = buf[2 * n_rows : 3 * n_rows]
         vidx_d = buf[3 * n_rows : 3 * n_rows + n_valid]
