@@ -49,6 +49,42 @@ def select_token_batch(logits: torch.Tensor, ranks: list[int]) -> list[int]:
     return sorted_idx[row, torch.tensor(ranks, device=logits.device)].tolist()
 
 
+def replay_accepted_tokens(
+    logits: torch.Tensor,
+    top_id_ths: list[list[int]],
+    num_accept_tokens: list[int],
+) -> list[list[int]]:
+    """Replay accepted prefixes, skipping rejected rows for a single segment.
+
+    Multi-segment partial acceptance keeps the full-batch sort to avoid
+    materializing another large logits tensor.
+    """
+    total_rows = sum(len(ranks) for ranks in top_id_ths)
+    total_accepted = sum(num_accept_tokens)
+    if total_accepted == 0:
+        return [[] for _ in top_id_ths]
+    if total_accepted < total_rows:
+        nonempty = []
+        offset = 0
+        for index, (accept, ranks) in enumerate(zip(num_accept_tokens, top_id_ths)):
+            if accept:
+                nonempty.append((index, offset, accept))
+            offset += len(ranks)
+        if len(nonempty) == 1:
+            index, offset, accept = nonempty[0]
+            sampled = [[] for _ in top_id_ths]
+            sampled[index] = select_token_batch(logits[offset : offset + accept], top_id_ths[index][:accept])
+            return sampled
+
+    flat_ids = select_token_batch(logits, [r for ranks in top_id_ths for r in ranks])
+    sampled_token_ids = []
+    offset = 0
+    for accept, ranks in zip(num_accept_tokens, top_id_ths):
+        sampled_token_ids.append(flat_ids[offset : offset + accept])
+        offset += len(ranks)
+    return sampled_token_ids
+
+
 class LwdEdgeExecutionMixin(LwdStagingMixin):
     """Embed + unembed compute for the LWD edge (no native step pipeline)."""
 
@@ -376,12 +412,7 @@ class LwdEdgeExecutionMixin(LwdStagingMixin):
         except Exception:  # noqa: BLE001
             pass
 
-        flat_ids = select_token_batch(logits, [r for ranks in batch_meta.top_id_ths for r in ranks])
-        sampled_token_ids = []
-        off = 0
-        for accept, ranks in zip(batch_meta.num_accept_tokens, batch_meta.top_id_ths):
-            sampled_token_ids.append(flat_ids[off : off + accept])
-            off += len(ranks)
+        sampled_token_ids = replay_accepted_tokens(logits, batch_meta.top_id_ths, batch_meta.num_accept_tokens)
         _t_sel = time.monotonic()
         # [Lwd][perf] Temporary probes attributing single-request latency:
         # post_recv = posting the irecv; wait_tensor = waiting for the

@@ -110,26 +110,120 @@ def test_plain_collector_uses_deterministic_ranking() -> None:
         ["a", "b"],
     )
     assert selection is not None
+    assert selection.hidden_packet is hidden
     assert selection.ranks[0].tolist() == [2, 0]
     assert select_token_batch(logits, selection.ranks[0].tolist()) == [2, 0]
 
 
-def test_spec_collector_ranks_accepted_rows_and_masks_rejected_rows() -> None:
+def test_plain_collector_partial_cover_keeps_selected_rows() -> None:
     runner = make_runner()
-    runner._lwd_h2d_stage_i64 = torch.from_numpy
     logits = torch.tensor([[10.0, 10.0, 0.0]]).repeat(3, 1)
     hidden = torch.arange(6).reshape(3, 2).float()
-    sampled = torch.tensor([[1, 2, -1]])
+    selected = torch.tensor([[2], [0], [1]])
+    selection = runner._lwd_pack_plain_down_rows(
+        hidden,
+        logits,
+        selected,
+        np.array([True, False, True]),
+        ["a", "b", "c"],
+    )
+    assert selection is not None
+    assert torch.equal(selection.hidden_packet, hidden[[0, 2]])
+    assert select_token_batch(logits[[0, 2]], selection.ranks[0].tolist()) == [2, 1]
+
+
+@pytest.mark.parametrize(
+    ("sampled_values", "expected_ranks", "expected_count"),
+    [
+        ([1, 2, -1], [1, 2, 0], 2),
+        ([1, 2, 0], [1, 2, 2], 3),
+    ],
+    ids=["masked-rejected-slot", "all-accepted"],
+)
+def test_spec_collector_single_request_full_cover_skips_index_staging(
+    sampled_values: list[int], expected_ranks: list[int], expected_count: int
+) -> None:
+    runner = make_runner()
+
+    def fail_index_staging(_arr: np.ndarray) -> torch.Tensor:
+        raise AssertionError("full-cover single-request path must not stage indices")
+
+    runner._lwd_h2d_stage_i64 = fail_index_staging
+    logits = torch.tensor([[10.0, 10.0, 0.0]]).repeat(3, 1)
+    hidden = torch.arange(6).reshape(3, 2).float()
     selection = runner._lwd_pack_spec_down_rows(
         hidden,
         logits,
-        sampled,
+        torch.tensor([sampled_values]),
         SimpleNamespace(num_draft_tokens=[2]),
         np.array([True]),
         ["a"],
     )
     assert selection is not None
-    assert selection.ranks[0].tolist() == [1, 2, 0]
+    assert selection.hidden_packet.data_ptr() == hidden.data_ptr()
+    assert selection.ranks[0].tolist() == expected_ranks
+    assert selection.counts_dev is not None
+    assert selection.counts_dev.tolist() == [expected_count]
+    assert selection.seg_lens_host == [3]
+    assert (
+        select_token_batch(logits[:expected_count], selection.ranks[0][:expected_count].tolist())
+        == sampled_values[:expected_count]
+    )
+
+
+def test_spec_collector_multiple_requests_keep_general_index_path() -> None:
+    runner = make_runner()
+    staging_calls = 0
+
+    def index_staging(arr: np.ndarray) -> torch.Tensor:
+        nonlocal staging_calls
+        staging_calls += 1
+        return torch.from_numpy(arr)
+
+    runner._lwd_h2d_stage_i64 = index_staging
+    logits = torch.tensor([[10.0, 10.0, 0.0]]).repeat(4, 1)
+    hidden = torch.arange(8).reshape(4, 2).float()
+    selection = runner._lwd_pack_spec_down_rows(
+        hidden,
+        logits,
+        torch.tensor([[1, 2], [2, -1]]),
+        SimpleNamespace(num_draft_tokens=[1, 1]),
+        np.array([True, True]),
+        ["a", "b"],
+    )
+    assert selection is not None
+    assert staging_calls == 1
+    assert torch.equal(selection.hidden_packet, hidden)
+    assert selection.counts_dev is not None
+    assert selection.counts_dev.tolist() == [2, 1]
+    assert selection.seg_lens_host == [2, 2]
+    assert select_token_batch(logits[:3], selection.ranks[0][:3].tolist()) == [1, 2, 2]
+
+
+def test_spec_collector_partial_cover_keeps_general_index_path() -> None:
+    runner = make_runner()
+    staging_calls = 0
+
+    def index_staging(arr: np.ndarray) -> torch.Tensor:
+        nonlocal staging_calls
+        staging_calls += 1
+        return torch.from_numpy(arr)
+
+    runner._lwd_h2d_stage_i64 = index_staging
+    logits = torch.tensor([[10.0, 10.0, 0.0]]).repeat(3, 1)
+    hidden = torch.arange(6).reshape(3, 2).float()
+    selection = runner._lwd_pack_spec_down_rows(
+        hidden,
+        logits,
+        torch.tensor([[9, 9, 9], [1, 2, -1]]),
+        SimpleNamespace(num_draft_tokens=[0, 2]),
+        np.array([False, True]),
+        ["a", "b"],
+    )
+    assert selection is not None
+    assert staging_calls == 1
+    assert torch.equal(selection.hidden_packet, hidden[1:3])
     assert selection.counts_dev is not None
     assert selection.counts_dev.tolist() == [2]
-    assert select_token_batch(logits[:2], selection.ranks[0][:2].tolist()) == [1, 2]
+    assert selection.seg_lens_host == [2]
+    assert select_token_batch(logits[1:3], selection.ranks[0].tolist()) == [1, 2]
