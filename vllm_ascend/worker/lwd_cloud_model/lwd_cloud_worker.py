@@ -61,8 +61,18 @@ if TYPE_CHECKING:
 _LWD_EARLY_RECV_DEQUEUE_TIMEOUT_S = 0.0005
 _LWD_EARLY_RECV_ERROR_SLEEP_S = 0.01
 _LWD_EARLY_RECV_LOOP_SLEEP_S = 0.002
-_LWD_EARLY_RECV_MAX_INFLIGHT = 2
-_LWD_HOST_STAGE_SLOTS = 2
+# In-flight UP receives and their device receive slots. The pipeline only
+# overlaps the edge's chunk N+1 embed/send with the cloud's chunk N forward
+# when a receive can be posted while an earlier received batch is still
+# waiting for its H2D consumption by the runner: with both limits equal, one
+# slot holds the in-flight receive and the other the undelivered batch, and
+# steady state degrades to a single in-flight receive per connection
+# (field: pre-recv inflight=1 queued=0 while 450-700ms stall steps appear
+# whenever the edge's next chunk is not yet on the wire). Stage slots cover
+# the received-but-unconsumed window, so they must grow with the inflight
+# depth, or every extra post bounces on LwdHostStageSlotBusy.
+_LWD_EARLY_RECV_MAX_INFLIGHT = 4
+_LWD_HOST_STAGE_SLOTS = 4
 _LWD_SHUTDOWN_TIMEOUT_S = 5.0
 
 
